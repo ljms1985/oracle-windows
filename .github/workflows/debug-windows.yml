@@ -63,7 +63,7 @@ jobs:
         shell: pwsh
         run: |
           $env:ORACLE_SMOKE_TEST = "1"
-          $p = Start-Process -FilePath "dist\Oracle-debug.exe" -RedirectStandardOutput "debug-run.log" -RedirectStandardError "debug-run-err.log" -PassThru -NoNewWindow
+          $p = Start-Process -FilePath "dist\Oracle-debug\Oracle-debug.exe" -RedirectStandardOutput "debug-run.log" -RedirectStandardError "debug-run-err.log" -PassThru -NoNewWindow
           if (-not $p.WaitForExit(25000)) {
             "SMOKE RESULT: process was still running after 25s (GUI started, no startup traceback) — killing it." | Out-File -FilePath debug-run.log -Append -Encoding utf8
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
@@ -83,5 +83,5 @@ jobs:
           name: Oracle-debug-log
           path: |
             debug-run.log
-            dist/Oracle-debug.exe
+            dist/Oracle-debug/Oracle-debug.exe
           if-no-files-found: error

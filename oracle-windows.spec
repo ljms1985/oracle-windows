@@ -3,32 +3,40 @@
 # Build ON WINDOWS ONLY (a Windows .exe cannot be built on macOS or Linux):
 #   pip install pyinstaller
 #   pyinstaller oracle-windows.spec
-# Output: dist/Oracle.exe  (double-click to run; no Python install needed)
+# Output: dist/Oracle/Oracle.exe  (double-click to run; no Python install
+# needed). The whole dist/Oracle folder is the install — copy the folder,
+# run Oracle.exe inside it. Do NOT move Oracle.exe out of its folder:
+# the Tcl/Tk data and DLLs live next to it.
 #
 # This spec is built by GitHub Actions on a real Windows runner
-# (see .github/workflows/build-windows.yml). It is a single-file,
-# windowed (no console) build of gui.py — the Gideon-style GUI.
+# (see .github/workflows/build-windows.yml).
 # No OpenAI API key, password, or credential is bundled: the user adds
 # her own OPENAI_API_KEY on first run (the GUI says so if it is missing).
 #
-# v1.0.1 — Tcl/Tk fix (see oracle_paths.py / rth_tcl.py):
-# v1.0.0 crashed on Lorenza's real PC with "Failed to execute script
-# 'gui'" and "can't find a usable init.tcl". The same build PASSED the
-# tkinter smoke test on the GitHub Windows runner, and _tcl_data /
-# _tk_data WERE in the bundle — so the PC failure was not "no Tcl data
-# in the exe". The most likely cause is a TCL_LIBRARY / TK_LIBRARY
-# environment variable on that PC pointing tkinter at a broken Python
-# install, overriding PyInstaller's own hook. This spec therefore:
-#   * collects ALL of tkinter explicitly (collect_all) instead of
-#     relying only on the hook,
-#   * ALSO bundles the Tcl/Tk library folders directly from the build
-#     Python (Tree: tcl8.6 -> _tcl_data, tk8.6 -> _tk_data),
-#   * runs rth_tcl.py before gui.py, which sets TCL_LIBRARY /
-#     TK_LIBRARY to the bundled data, and gui.py calls
-#     oracle_paths.fix_tcl() before importing tkinter as a second layer.
-# UPX is off in v1.0.1: UPX-compressed binaries are a known source of
-# extraction / antivirus trouble on real PCs, and removing that
-# variable costs only a few MB.
+# v1.0.2 — ONE-DIR build (was one-file in v1.0.0 / v1.0.1).
+# Why: both one-file builds crashed on Lorenza's real PC with
+# "_tkinter.TclError: Can't find a usable init.tcl", even though the
+# extracted _tcl_data/init.tcl was present, readable, and had the
+# correct header. The one-file bootloader extracts the bundle into a
+# temp _MEI folder — on her PC that was C:\WINDOWS\TEMP\_MEI... —
+# and tkinter reported the extracted init.tcl as "not usable".
+# The v1.0.1 fix_tcl() (re-pointing TCL_LIBRARY at the same extracted
+# data) could not fix that, because the extracted data was the problem.
+# A one-dir build extracts nothing at runtime: Tcl/Tk data sits in
+# real folders next to Oracle.exe (_tcl_data/tcl8.6/, _tk_data/tk8.6/),
+# exactly as PyInstaller's official tkinter hook lays them out, and
+# tkinter finds init.tcl through its normal search. This also removes
+# the v1.0.1 duplicate: the spec no longer flattens a second copy of
+# tcl8.6 directly into _tcl_data (Tree tcl8.6 -> _tcl_data), which
+# created a top-level _tcl_data/init.tcl alongside
+# _tcl_data/tcl8.6/init.tcl and gave fix_tcl()/the runtime hook an
+# ambiguous, flattened root to point TCL_LIBRARY at.
+# The spec therefore now relies ONLY on collect_all("tkinter") for
+# Tcl/Tk, drops the rth_tcl.py runtime hook, and oracle_paths.fix_tcl()
+# will only ever point at a versioned tcl8.6/tk8.6 folder, never at
+# the _tcl_data/_tk_data root itself.
+# UPX stays off: UPX-compressed binaries are a known source of
+# extraction / antivirus trouble on real PCs.
 
 # -*- mode: python ; coding: utf-8 -*-
 
@@ -39,18 +47,9 @@ from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
 
-# --- Tcl/Tk: collect everything, twice over ---------------------------
-# (1) PyInstaller's own tkinter collection.
+# --- Tcl/Tk: PyInstaller's own tkinter collection ONLY ----------------
+# No manual Tree copy, no flattened second copy of tcl8.6/tk8.6.
 _tk_datas, _tk_binaries, _tk_hidden = collect_all("tkinter")
-
-# (2) Direct copy of the Tcl/Tk library folders from the build Python,
-# so init.tcl is present even if the hook collection ever changes.
-# Layout matches the hook's: tcl8.6/* -> _tcl_data/*, tk8.6/* -> _tk_data/*.
-_tcl_extra_datas = []
-for _lib, _dest in (("tcl8.6", "_tcl_data"), ("tk8.6", "_tk_data")):
-    _src = os.path.join(sys.base_prefix, "tcl", _lib)
-    if os.path.isdir(_src):
-        _tcl_extra_datas.append((_src, _dest))
 
 a = Analysis(
     ['gui.py'],
@@ -71,7 +70,7 @@ a = Analysis(
         ('avatar.png', '.'),
         # Sample STL prints (design3d.py writes new ones to prints/).
         ('prints', 'prints'),
-    ] + _tk_datas + _tcl_extra_datas,
+    ] + _tk_datas,
     hiddenimports=[
         'agent', 'computer', 'voice', 'camera', 'monitor',
         'email_alerts', 'identity', 'repair', 'design3d', 'security',
@@ -81,7 +80,7 @@ a = Analysis(
     ] + _tk_hidden,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=['rth_tcl.py'],
+    runtime_hooks=[],
     excludes=['face_recognition'],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
@@ -90,13 +89,13 @@ a = Analysis(
 )
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# One-dir: EXE excludes binaries/datas here; COLLECT puts them in
+# dist/Oracle/ next to Oracle.exe.
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='Oracle',
     debug=False,
     bootloader_ignore_signals=False,
@@ -110,4 +109,14 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='Oracle',
 )

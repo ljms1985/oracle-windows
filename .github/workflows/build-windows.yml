@@ -1,8 +1,16 @@
 # Oracle for Windows — GitHub Actions build
 #
-# Builds a standalone, double-clickable Oracle.exe on a real Windows
-# machine in the cloud (GitHub-hosted windows-latest runner). No
-# Windows packaging tools are needed locally to produce the .exe.
+# Builds a standalone Oracle install on a real Windows machine in the
+# cloud (GitHub-hosted windows-latest runner). No Windows packaging
+# tools are needed locally to produce it.
+#
+# v1.0.2 is a ONE-DIR build: dist/Oracle/Oracle.exe plus its supporting
+# files in the same folder (DLLs, _tcl_data/, _tk_data/, avatar). The
+# whole dist/Oracle folder is the install — copy the folder, run
+# Oracle.exe inside it. Do NOT move Oracle.exe out of its folder.
+# One-file builds (v1.0.0/v1.0.1) crashed on Lorenza's real PC with
+# "can't find a usable init.tcl" even though the extracted init.tcl
+# was present — the _MEI temp extraction was the problem.
 #
 # UNSIGNED BUILD — no signing certificate, no code-signing secrets.
 # On first launch on a real Windows PC, Windows SmartScreen / Defender
@@ -13,10 +21,10 @@
 #
 # Triggers:
 #   - Manually: Actions tab -> "Build Oracle for Windows" -> Run workflow
-#   - Automatically: pushing a tag like v1.0.0 (git tag v1.0.0 && git push --tags)
+#   - Automatically: pushing a tag like v1.0.2 (git tag v1.0.2 && git push --tags)
 #
 # Outputs (download from the finished run, under "Artifacts"):
-#   - Oracle.exe — single-file, windowed build of gui.py
+#   - Oracle-windows-v1.0.2.zip — the whole dist/Oracle folder
 #
 # What the workflow does NOT do: it does not publish a release, does
 # not test the GUI by clicking it, and does not bundle an OpenAI API
@@ -56,21 +64,32 @@ jobs:
         # PowerShell does not glob *.py for python, so list the files.
         run: python -m py_compile agent.py camera.py computer.py design3d.py email_alerts.py gui.py identity.py monitor.py oracle_paths.py repair.py rth_tcl.py security.py sms.py voice.py
 
-      - name: Build Oracle.exe with PyInstaller
+      - name: Build Oracle (one-dir) with PyInstaller
         run: pyinstaller oracle-windows.spec
 
-      # v1.0.1 gate: do NOT ship a windowed build whose tkinter cannot
-      # start. Build the console debug exe from the same code/spec and
-      # run its smoke test — it proves tk.Tk() finds init.tcl. The
-      # windowed build hides tracebacks, so this gate is what catches
-      # a repeat of the v1.0.0 "Failed to execute script 'gui'" crash
-      # before the .exe is released.
+      # v1.0.2 gate: verify the Tcl/Tk layout a one-dir build must have.
+      # init.tcl must live in a VERSIONED folder (_tcl_data/tcl8.6/),
+      # and there must be NO flattened _tcl_data/init.tcl at the root
+      # (that duplicate was part of the v1.0.1 failure).
+      - name: Verify Tcl/Tk layout in dist/Oracle
+        shell: pwsh
+        run: |
+          if (-not (Test-Path dist\Oracle\_tcl_data\tcl8.6\init.tcl)) { Write-Error "ERROR: dist/Oracle/_tcl_data/tcl8.6/init.tcl is missing"; exit 1 }
+          if (-not (Test-Path dist\Oracle\_tk_data\tk8.6\tk.tcl)) { Write-Error "ERROR: dist/Oracle/_tk_data/tk8.6/tk.tcl is missing"; exit 1 }
+          if (Test-Path dist\Oracle\_tcl_data\init.tcl) { Write-Error "ERROR: flattened dist/Oracle/_tcl_data/init.tcl must not exist"; exit 1 }
+          Write-Host "Tcl/Tk layout OK: versioned tcl8.6/tk8.6 folders present, no flattened root init.tcl."
+
+      # Gate: do NOT ship a build whose tkinter cannot start. Build the
+      # console debug exe from the same code/spec and run its smoke test
+      # — it proves tk.Tk() finds init.tcl. The windowed build hides
+      # tracebacks, so this gate is what catches a repeat of the
+      # "Failed to execute script 'gui'" crash before release.
       - name: Smoke-test tkinter startup (console debug build)
         shell: pwsh
         run: |
           pyinstaller oracle-windows-debug.spec
           $env:ORACLE_SMOKE_TEST = "1"
-          $out = & dist\Oracle-debug.exe 2>&1 | Out-String
+          $out = & dist\Oracle-debug\Oracle-debug.exe 2>&1 | Out-String
           Write-Host $out
           if ($out -notmatch "SMOKE OK") { Write-Error "SMOKE TEST FAILED: tkinter did not start in the frozen build"; exit 1 }
           Write-Host "Smoke test passed: tkinter started in the frozen build."
@@ -78,22 +97,27 @@ jobs:
       - name: Verify Oracle.exe is a real Windows PE executable
         shell: pwsh
         run: |
-          if (-not (Test-Path dist/Oracle.exe)) { Write-Error "ERROR: dist/Oracle.exe was not built"; exit 1 }
-          $bytes = [System.IO.File]::ReadAllBytes("dist/Oracle.exe")
+          if (-not (Test-Path dist\Oracle\Oracle.exe)) { Write-Error "ERROR: dist/Oracle/Oracle.exe was not built"; exit 1 }
+          $bytes = [System.IO.File]::ReadAllBytes("dist/Oracle/Oracle.exe")
           if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { Write-Error "ERROR: Oracle.exe does not start with the MZ header"; exit 1 }
           $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
           $peSig = [System.Text.Encoding]::ASCII.GetString($bytes, $peOffset, 4)
           if ($peSig -ne "PE`0`0") { Write-Error "ERROR: Oracle.exe has no PE signature"; exit 1 }
-          $sizeMB = [math]::Round((Get-Item dist/Oracle.exe).Length / 1MB, 1)
+          $sizeMB = [math]::Round((Get-Item dist\Oracle\Oracle.exe).Length / 1MB, 1)
           Write-Host "Oracle.exe verified: PE executable, $sizeMB MB"
-          if (-not (Test-Path dist/Oracle.exe)) { exit 1 }
-          # Avatar must be bundled inside the one-file exe (check the spec datas)
+          # Avatar must be bundled in the one-dir folder (check the spec datas)
           Select-String -Path oracle-windows.spec -Pattern "assets/avatar.png" -Quiet | Out-Null
-          Get-Item dist/Oracle.exe | Format-List Name, Length, LastWriteTime
+          Get-Item dist\Oracle\Oracle.exe | Format-List Name, Length, LastWriteTime
 
-      - name: Upload Oracle.exe artifact
+      - name: Zip the one-dir install folder
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\Oracle -DestinationPath Oracle-windows-v1.0.2.zip
+          Get-Item Oracle-windows-v1.0.2.zip | Format-List Name, Length, LastWriteTime
+
+      - name: Upload Oracle install zip artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Oracle-windows-exe
-          path: dist/Oracle.exe
+          name: Oracle-windows-v1.0.2-zip
+          path: Oracle-windows-v1.0.2.zip
           if-no-files-found: error

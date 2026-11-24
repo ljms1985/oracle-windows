@@ -1,4 +1,8 @@
-# PyInstaller runtime hook — runs before gui.py starts.
+# RETIRED in v1.0.2 — no longer used by oracle-windows.spec.
+# (One-dir builds rely on PyInstaller's own tkinter hook, and
+#  fix_tcl() in oracle_paths.py is the only Tcl fix now, and it
+#  only ever points at a versioned tcl8.6/tk8.6 folder.)
+# Old runtime hook — ran before gui.py started.
 # Sets TCL_LIBRARY / TK_LIBRARY to the bundled Tcl/Tk data inside
 # sys._MEIPASS so tkinter's tk.Tk() can find init.tcl. This is a
 # self-contained copy of the logic in oracle_paths.fix_tcl() because

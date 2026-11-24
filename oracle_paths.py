@@ -94,17 +94,20 @@ def fix_tcl():
 
     Safe to call when unfrozen (does nothing) and safe to call twice.
     Returns True when both libraries were located.
+
+    v1.0.2: only a VERSIONED folder (tcl8.6/tk8.6) is ever used.
+    Pointing TCL_LIBRARY at the _tcl_data/_tk_data root itself was
+    part of the v1.0.1 failure: the spec had flattened a second copy
+    of tcl8.6 into _tcl_data, so the root contained init.tcl but was
+    not a usable Tcl library dir. If no versioned folder is found,
+    leave the variables alone — PyInstaller's own tkinter hook sets
+    them correctly for a one-dir build.
     """
     meipass = _meipass()
     if meipass is None:
         return False
     tcl_dir = _find_tcl_dir(meipass, ("tcl8.6", "tcl8.7", "tcl"))
     tk_dir = _find_tcl_dir(meipass, ("tk8.6", "tk8.7", "tk"))
-    # Fall back to the collected data roots themselves.
-    if tcl_dir is None and (meipass / "_tcl_data").is_dir():
-        tcl_dir = meipass / "_tcl_data"
-    if tk_dir is None and (meipass / "_tk_data").is_dir():
-        tk_dir = meipass / "_tk_data"
     if tcl_dir is not None:
         os.environ["TCL_LIBRARY"] = str(tcl_dir)
     if tk_dir is not None:
