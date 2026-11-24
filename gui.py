@@ -34,6 +34,7 @@ LLM_PROVIDER=ollama). The GUI is the face; agent.py is the brain.
 
 import math
 import os
+import queue
 import random
 import sys
 import threading
@@ -159,6 +160,14 @@ class OracleGUI:
         self.always_listen = True
         self.speak_replies = True
         self.busy = False
+        self._ask_started = None  # datetime the current _ask thread started
+        # Main-thread UI queue: tkinter is NOT thread-safe. Worker
+        # threads must NEVER call root.after() / widget methods
+        # directly — a cross-thread root.after() can silently fail,
+        # which left _ask's reply undelivered and busy=True forever
+        # ("thinking forever", 2026-11-24). Workers put callables
+        # here; the main thread drains them on its own clock tick.
+        self._ui_queue = queue.Queue()
         self.listen_thread = None
         self.watcher = None
         self.camera_controller = None
@@ -176,6 +185,7 @@ class OracleGUI:
         self._build_main()
         self.animate()
         self._tick_clock()
+        self._drain_ui_queue()
 
         self.append("system", f"{AGENT_NAME} online. Ask me anything — watch the core light up when I answer.")
         if PROVIDER == "openai" and not os.environ.get("OPENAI_API_KEY"):
@@ -198,6 +208,34 @@ class OracleGUI:
                 log_path = Path(__file__).resolve().parent / "voice-listening.log"
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {line}\n")
+        except Exception:
+            pass
+
+    def _post_ui(self, fn):
+        """Queue a callable to run on the main (tkinter) thread.
+
+        The ONLY way worker threads may touch the UI. Never call
+        root.after() or widget methods from a worker thread."""
+        try:
+            self._ui_queue.put(fn)
+        except Exception:
+            pass
+
+    def _drain_ui_queue(self):
+        """Main-thread drain of the UI queue, every 50 ms."""
+        try:
+            while True:
+                fn = self._ui_queue.get_nowait()
+                try:
+                    fn()
+                except Exception as e:
+                    self._log_listening(f"UI QUEUE ERROR: {e}")
+        except queue.Empty:
+            pass
+        except Exception:
+            pass
+        try:
+            self.root.after(50, self._drain_ui_queue)
         except Exception:
             pass
 
@@ -392,6 +430,21 @@ class OracleGUI:
     def _tick_clock(self):
         try:
             self.clock_label.config(text=datetime.now().strftime("%H:%M  •  %a %d %b"))
+        except Exception:
+            pass
+        # Watchdog: if a reply thread started >120 s ago and busy is
+        # still True, the THINKING state is stuck — reset it visibly
+        # instead of ignoring every later speak/type forever.
+        try:
+            if self.busy and self._ask_started is not None:
+                elapsed = (datetime.now() - self._ask_started).total_seconds()
+                if elapsed > 120:
+                    self.busy = False
+                    self._ask_started = None
+                    self.mode = "idle"
+                    self.status.config(text="● ONLINE", fg=self.t["good"])
+                    self.append("system", "That reply timed out after 120 seconds, so I reset and I'm ready again. Please try once more.")
+                    self._log_listening("WATCHDOG: stuck THINKING reset after 120s")
         except Exception:
             pass
         self.root.after(1000, self._tick_clock)
@@ -640,19 +693,19 @@ class OracleGUI:
             heard = voice_mod.listen_once(timeout=3)
             if heard and self.always_listen:
                 self._log_listening(f"HEARD: {heard}")
-                self.root.after(0, lambda h=heard: self.handle_user_text(h, spoken=True))
+                self._post_ui(lambda h=heard: self.handle_user_text(h, spoken=True))
 
     def check_improvements(self):
         self.append("system", "Checking the internet for possible improvements. Proposals only - nothing will change without your YES, by email or in this GUI.")
         def _run():
             if monitor_mod is None:
-                self.root.after(0, lambda: self.append("system", "monitor.py not found in this folder."))
+                self._post_ui(lambda: self.append("system", "monitor.py not found in this folder."))
                 return
             try:
                 monitor_mod.run_daily_check()
-                self.root.after(0, lambda: self.append("system", "Check done. See the proposals/ folder and any email sent. Reply YES to apply, NO to skip."))
+                self._post_ui(lambda: self.append("system", "Check done. See the proposals/ folder and any email sent. Reply YES to apply, NO to skip."))
             except Exception as e:
-                self.root.after(0, lambda: self.append("system", f"Improvement check failed: {e}"))
+                self._post_ui(lambda: self.append("system", f"Improvement check failed: {e}"))
         threading.Thread(target=_run, daemon=True).start()
 
     def toggle_watch(self):
@@ -664,7 +717,7 @@ class OracleGUI:
                 self.camera_controller = camera_mod.CameraController()
                 self.watcher = camera_mod.Watcher(
                     controller=self.camera_controller,
-                    on_alert=lambda txt: self.root.after(0, lambda: self.append("system", txt)),
+                    on_alert=lambda txt: self._post_ui(lambda: self.append("system", txt)),
                 )
                 msg = self.watcher.start()
                 self.watch_btn.config(text="Stop camera watch", bg=self.t["danger"])
@@ -710,7 +763,7 @@ class OracleGUI:
         # Home mode, per your instruction: naming the person is enrollment.
         def _run():
             result = identity_mod.enroll_voice(name, consent=True)
-            self.root.after(0, lambda: self.append("system", result))
+            self._post_ui(lambda: self.append("system", result))
         threading.Thread(target=_run, daemon=True).start()
 
     def delete_identity_gui(self):
@@ -735,9 +788,9 @@ class OracleGUI:
             s = repair_mod.RepairSession("Apollo Twin USB", "won't turn on")
             try:
                 s.look_at_board()
-                self.root.after(0, lambda: self.append("system", "Board look done - check the transcript above and the repairs/ snapshot. Tell me if that matches what you see, and point closer to any area you want re-checked."))
+                self._post_ui(lambda: self.append("system", "Board look done - check the transcript above and the repairs/ snapshot. Tell me if that matches what you see, and point closer to any area you want re-checked."))
             except Exception as e:
-                self.root.after(0, lambda: self.append("system", f"Board look failed: {e}"))
+                self._post_ui(lambda: self.append("system", f"Board look failed: {e}"))
         threading.Thread(target=_run, daemon=True).start()
 
     def on_send(self):
@@ -751,48 +804,77 @@ class OracleGUI:
         if self.busy:
             return
         self.busy = True
+        self._ask_started = datetime.now()
         self.append("user", user_text + ("  [spoken]" if spoken else ""))
         self.history.append({"role": "user", "content": user_text})
         self.mode = "thinking"
         self.status.config(text="● THINKING", fg=self.t["warn"])
         threading.Thread(target=self._ask, args=(user_text,), daemon=True).start()
 
-    def _ask(self):
-        if call_llm is None:
-            reply = "I could not load my brain (agent.py). Make sure agent.py is in the same folder as gui.py."
-        else:
-            messages = [{"role": "system", "content": PERSONALITY}] + self.history
-            try:
-                reply = call_llm(messages)
-            except Exception as e:
-                reply = (f"I hit a problem reaching OpenAI: {e}. "
-                         "Check that OPENAI_API_KEY is set on this PC and that you have internet, then try again.")
-        self.history.append({"role": "assistant", "content": reply})
-        self.root.after(0, lambda: self._typewriter(reply))
+    def _ask(self, user_text):
+        # Runs on a worker thread: never touch tkinter directly.
+        # try/finally guarantees busy always clears, and every
+        # outcome is logged, so a dead reply thread can no longer
+        # leave the GUI stuck on THINKING forever.
+        try:
+            if call_llm is None:
+                reply = "I could not load my brain (agent.py). Make sure agent.py is in the same folder as gui.py."
+            else:
+                messages = [{"role": "system", "content": PERSONALITY}] + self.history
+                try:
+                    reply = call_llm(messages)
+                except Exception as e:
+                    reply = (f"I hit a problem reaching OpenAI: {e}. "
+                             "Check that OPENAI_API_KEY is set on this PC and that you have internet, then try again.")
+            self.history.append({"role": "assistant", "content": reply})
+            self._log_listening(f"ASK OK: {user_text[:80]!r} -> reply {len(reply)} chars")
+            self._post_ui(lambda r=reply: self._typewriter(r))
+        except Exception as e:
+            self._log_listening(f"ASK FAILED: {e}")
+            self._post_ui(lambda err=e: self._typewriter(
+                f"I hit a problem answering that: {err}. Please try again."))
+        finally:
+            # busy is cleared by _typewriter when the reply finishes
+            # typing; the watchdog in _tick_clock clears it if the
+            # reply never reaches the screen.
+            pass
 
     def _typewriter(self, full_text, idx=0):
-        if idx == 0:
-            self.mode = "speaking"
-            self.status.config(text="● SPEAKING", fg=self.t["accent"])
-            if self.speak_replies and voice_mod is not None:
-                voice_mod.speak_async(full_text)
-            self.text.configure(state="normal")
-            self.text.insert("end", f"{AGENT_NAME}: ", "oracle")
-            self.text.configure(state="disabled")
-        if idx < len(full_text):
-            chunk = full_text[idx:idx + 3]
-            self.text.configure(state="normal")
-            self.text.insert("end", chunk, "oracle")
-            self.text.configure(state="disabled")
-            self.text.see("end")
-            self.root.after(18, lambda: self._typewriter(full_text, idx + 3))
-        else:
-            self.text.configure(state="normal")
-            self.text.insert("end", "\n\n")
-            self.text.configure(state="disabled")
+        # Runs on the main thread only (via _post_ui). Any exception
+        # here must still clear busy, or the GUI sticks on THINKING.
+        try:
+            if idx == 0:
+                self.mode = "speaking"
+                self.status.config(text="● SPEAKING", fg=self.t["accent"])
+                if self.speak_replies and voice_mod is not None:
+                    voice_mod.speak_async(full_text)
+                self.text.configure(state="normal")
+                self.text.insert("end", f"{AGENT_NAME}: ", "oracle")
+                self.text.configure(state="disabled")
+            if idx < len(full_text):
+                chunk = full_text[idx:idx + 3]
+                self.text.configure(state="normal")
+                self.text.insert("end", chunk, "oracle")
+                self.text.configure(state="disabled")
+                self.text.see("end")
+                self.root.after(18, lambda: self._typewriter(full_text, idx + 3))
+            else:
+                self.text.configure(state="normal")
+                self.text.insert("end", "\n\n")
+                self.text.configure(state="disabled")
+                self.mode = "idle"
+                self.busy = False
+                self._ask_started = None
+                self.status.config(text="● ONLINE", fg=self.t["good"])
+        except Exception as e:
+            self._log_listening(f"TYPEWRITER FAILED: {e}")
             self.mode = "idle"
             self.busy = False
-            self.status.config(text="● ONLINE", fg=self.t["good"])
+            self._ask_started = None
+            try:
+                self.status.config(text="● ONLINE", fg=self.t["good"])
+            except Exception:
+                pass
 
 
 def _write_crash_log(exc_text):

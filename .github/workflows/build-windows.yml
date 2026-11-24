@@ -68,16 +68,16 @@ jobs:
         run: pyinstaller oracle-windows.spec
 
       # v1.0.2 gate: verify the Tcl/Tk layout a one-dir build must have.
-      # init.tcl must live in a VERSIONED folder (_tcl_data/tcl8.6/),
-      # and there must be NO flattened _tcl_data/init.tcl at the root
-      # (that duplicate was part of the v1.0.1 failure).
+      # PyInstaller 6 lays Tcl out FLAT in _tcl_data/ (init.tcl,
+      # encoding/, msgs/ directly inside it) — that is its standard
+      # layout, NOT _tcl_data/tcl8.6/. Same for _tk_data/tk.tcl.
       - name: Verify Tcl/Tk layout in dist/Oracle
         shell: pwsh
         run: |
-          if (-not (Test-Path dist\Oracle\_tcl_data\tcl8.6\init.tcl)) { Write-Error "ERROR: dist/Oracle/_tcl_data/tcl8.6/init.tcl is missing"; exit 1 }
-          if (-not (Test-Path dist\Oracle\_tk_data\tk8.6\tk.tcl)) { Write-Error "ERROR: dist/Oracle/_tk_data/tk8.6/tk.tcl is missing"; exit 1 }
-          if (Test-Path dist\Oracle\_tcl_data\init.tcl) { Write-Error "ERROR: flattened dist/Oracle/_tcl_data/init.tcl must not exist"; exit 1 }
-          Write-Host "Tcl/Tk layout OK: versioned tcl8.6/tk8.6 folders present, no flattened root init.tcl."
+          if (-not (Test-Path dist\Oracle\_tcl_data\init.tcl)) { Write-Error "ERROR: dist/Oracle/_tcl_data/init.tcl is missing"; exit 1 }
+          if (-not (Test-Path dist\Oracle\_tk_data\tk.tcl)) { Write-Error "ERROR: dist/Oracle/_tk_data/tk.tcl is missing"; exit 1 }
+          if (-not (Test-Path dist\Oracle\_tcl_data\encoding)) { Write-Error "ERROR: dist/Oracle/_tcl_data/encoding is missing"; exit 1 }
+          Write-Host "Tcl/Tk layout OK: _tcl_data/init.tcl, _tk_data/tk.tcl and _tcl_data/encoding present."
 
       # Gate: do NOT ship a build whose tkinter cannot start. Build the
       # console debug exe from the same code/spec and run its smoke test
