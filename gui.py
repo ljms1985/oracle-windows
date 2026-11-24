@@ -161,6 +161,22 @@ class OracleGUI:
         self.speak_replies = True
         self.busy = False
         self._ask_started = None  # datetime the current _ask thread started
+        # --- Fluid lip-sync state (v1.0.6) ---
+        # voice.py calls _on_speech_level(level, shape) from its
+        # playback thread with the REAL audio RMS level; the GUI never
+        # touches tkinter from that thread — it only stores the target
+        # here, and animate() (main thread) eases lip_level towards
+        # it every frame, so the mouth moves smoothly, never snaps.
+        self.lip_level = 0.0       # eased 0..1, read by animate()
+        self._lip_target_level = 0.0
+        self._lip_shape = "closed"  # closed/slight/open/wide/round
+        self._typing_done = False
+        self._speech_done = True
+        # --- Avatar-only mode state (v1.0.6) ---
+        self.avatar_win = None
+        self._avatar_mode = False
+        self._avatar_drag = None
+        self._avatar_pil = None    # PIL image, for the avatar-only window
         # Main-thread UI queue: tkinter is NOT thread-safe. Worker
         # threads must NEVER call root.after() / widget methods
         # directly — a cross-thread root.after() can silently fail,
@@ -183,6 +199,13 @@ class OracleGUI:
 
         self._build_top()
         self._build_main()
+        self._refresh_api_key_label()
+        # Minimise -> avatar-only mode (v1.0.6): clicking the minimise
+        # button hides the main box and leaves just the avatar.
+        try:
+            self.root.bind("<Unmap>", self._on_unmap)
+        except Exception:
+            pass
         self.animate()
         self._tick_clock()
         self._drain_ui_queue()
@@ -329,6 +352,18 @@ class OracleGUI:
             deck_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
         deck_canvas.bind_all("<MouseWheel>", _on_wheel)
 
+        # API KEY card — first in the left deck, visible on first open
+        # (v1.0.6). The key itself is NEVER shown; only SET / NOT SET
+        # and the last 4 characters.
+        key_card = self._card(deck, "🔑  API KEY")
+        self.api_key_label = tk.Label(key_card, text="Key: …", font=("Segoe UI", 9, "bold"),
+                                      fg=t["muted"], bg=t["panel"])
+        self.api_key_label.pack(anchor="w", pady=(2, 4))
+        self._btn(key_card, "Change API Key", self._show_api_key_dialog).pack(fill="x", pady=2)
+        tk.Label(key_card, text="Saved on this PC only. Never in source code, logs, or email.",
+                 font=("Segoe UI", 8), fg=t["muted"], bg=t["panel"],
+                 wraplength=200, justify="left").pack(anchor="w", pady=(2, 0))
+
         voice_card = self._card(deck, "◇  VOICE")
         self.listen_btn = self._btn(voice_card, "Always listen: OFF", self.toggle_listen)
         self.listen_btn.pack(fill="x", pady=2)
@@ -356,6 +391,7 @@ class OracleGUI:
         ptz.grid_columnconfigure(1, weight=1)
         priv = self._btn(cam_card, "Privacy mode", self.camera_privacy)
         priv.pack(fill="x", pady=2)
+        self._btn(cam_card, "Test camera (grab a frame)", self.test_camera_gui).pack(fill="x", pady=2)
         self.cam_label = tk.Label(cam_card, text="Camera: OFF", font=("Segoe UI", 9, "bold"),
                                   fg=t["muted"], bg=t["panel"])
         self.cam_label.pack(anchor="w", pady=(4, 0))
@@ -375,6 +411,7 @@ class OracleGUI:
 
         sys_card = self._card(deck, "⚙  SYSTEM")
         self._btn(sys_card, "Check for improvements", self.check_improvements).pack(fill="x", pady=2)
+        self._btn(sys_card, "Avatar only  ◐", self._enter_avatar_only).pack(fill="x", pady=2)
         self._btn(sys_card, "Switch theme  ◐", self.switch_theme).pack(fill="x", pady=2)
         tk.Label(sys_card, text="Proposals never apply without a clear YES, by email or in this GUI.",
                  font=("Segoe UI", 8), fg=t["muted"], bg=t["panel"],
@@ -479,6 +516,7 @@ class OracleGUI:
                     # on the dark console instead of a white box.
                     img = img.crop((430, 0, 1170, 680))
                     img = img.resize((self.avatar_w, self.avatar_h), Image.LANCZOS)
+                    self._avatar_pil = img
                     self.avatar_photo = ImageTk.PhotoImage(img)
                     print(f"Avatar: loaded {rel} ({self.avatar_w}x{self.avatar_h})")
                     return
@@ -503,14 +541,33 @@ class OracleGUI:
                                    fill="#fbe0c0", outline="")
                 c.create_line(exx - 18, eyy + 2, exx + 18, eyy + 2,
                               fill="#1a1a1a", width=2)
-        # Mouth: small dark oval over the smile while speaking, opening
-        # and closing. Kept deliberately small (the drawn smile is only
-        # a thin line) so it reads as an open mouth, not a dark patch.
+        # Mouth (v1.0.6): fluid lip-sync, NOT a binary open/closed
+        # toggle. animate() eases self.lip_level towards the real
+        # speech-audio RMS level from voice.py every frame, and the
+        # shape comes from the word being spoken (round for O/U,
+        # wide for A/E). When speech ends the level eases back to
+        # closed — it never snaps shut.
         if self.mode == "speaking":
-            mouth_h = 2 + abs(math.sin(self.phase * 3.1)) * 5 + random.uniform(0, 2)
+            mw, mh = self._mouth_dims()
             mx, my = hx + look_x, hy + look_y + 38
-            c.create_oval(mx - 11, my - mouth_h, mx + 11, my + mouth_h,
+            c.create_oval(mx - mw, my - mh, mx + mw, my + mh,
                           fill="#40160f", outline="")
+
+    def _mouth_dims(self):
+        """(half-width, half-height) for the mouth, from the eased
+        lip level and the current phoneme shape. Returns a closed
+        mouth (near-zero height) when not speaking."""
+        level = self.lip_level if self.mode == "speaking" else 0.0
+        shape = self._lip_shape if self.mode == "speaking" else "closed"
+        if shape == "closed" or level < 0.04:
+            return (7, 1)
+        if shape == "slight":
+            return (10, 2 + level * 4)
+        if shape == "wide":
+            return (16, 4 + level * 13)
+        if shape == "round":
+            return (8, 5 + level * 11)
+        return (12, 3 + level * 9)  # "open"
 
 
     # ------------------------------------------------------------ chat
@@ -524,6 +581,13 @@ class OracleGUI:
     # ------------------------------------------------------------ animation
     def animate(self):
         self.phase += 0.12
+        # Ease the mouth towards the live speech level (v1.0.6):
+        # fast attack, gentle release, so it tracks speech smoothly
+        # and settles back to closed instead of snapping shut.
+        target = self._lip_target_level if self.mode == "speaking" else 0.0
+        self.lip_level += (target - self.lip_level) * (0.45 if target > self.lip_level else 0.25)
+        if abs(target - self.lip_level) < 0.01:
+            self.lip_level = target
         t = self.t
         c = self.canvas
         try:
@@ -606,11 +670,11 @@ class OracleGUI:
                               eye_cx + 20, eye_cy - 28 + brow_lift,
                               fill=t["accent2"], width=2)
 
-            # Mouth: actually talks while speaking, closed line when idle
+            # Mouth: fluid lip-sync (v1.0.6) — same eased level and
+            # phoneme shape as the avatar image, not a sine toggle.
             mouth_cy = hy + 48
             if self.mode == "speaking":
-                mouth_h = 8 + abs(math.sin(self.phase * 3.1)) * 16 + random.uniform(0, 7)
-                mouth_w = 30
+                mouth_w, mouth_h = self._mouth_dims()
                 c.create_oval(hx - mouth_w, mouth_cy - mouth_h, hx + mouth_w, mouth_cy + mouth_h,
                               fill="#08101f", outline=t["accent2"], width=2)
                 c.create_oval(hx - mouth_w * 0.55, mouth_cy + mouth_h * 0.25,
@@ -622,13 +686,13 @@ class OracleGUI:
                 c.create_arc(hx - 26, mouth_cy - 12, hx + 26, mouth_cy + 14,
                              start=200, extent=140, outline=t["accent"], width=2, style="arc")
 
-        # Waveform
+        # Waveform — bars follow the real speech level while speaking
         bars = 52
         for i in range(bars):
             x = cx - 260 + i * 10
             falloff = 1 - abs(i - 26) / 32
             if self.mode == "speaking":
-                bh = random.uniform(14, 58) * falloff
+                bh = (10 + self.lip_level * 55 + random.uniform(0, 6)) * falloff
             elif self.mode == "thinking":
                 bh = 14 + abs(math.sin(self.phase + i * 0.4)) * 26 * falloff
             else:
@@ -644,7 +708,245 @@ class OracleGUI:
                                    fg=t["warn"] if self.mode == "thinking" else t["accent"])
         except Exception:
             pass
-        self.root.after(50, self.animate)
+        self.root.after(33, self.animate)  # ~30 fps for smooth lip-sync
+
+    # ------------------------------------------------------------ speech / lip-sync
+    def _on_speech_level(self, level, shape):
+        """Called from voice.py's playback thread. NEVER touch
+        tkinter here — just store the target; animate() (main
+        thread) eases towards it."""
+        self._lip_target_level = max(0.0, min(1.0, float(level)))
+        self._lip_shape = shape if shape in ("closed", "slight", "open", "wide", "round") else "open"
+
+    def _on_speech_done(self):
+        """Called on the main thread when the spoken reply ends."""
+        self._speech_done = True
+        self._lip_target_level = 0.0
+        self._lip_shape = "closed"
+        self._maybe_finish_speaking()
+
+    def _maybe_finish_speaking(self):
+        """Only go back to IDLE (and clear busy) once BOTH the reply
+        has finished typing AND the voice has finished speaking — the
+        old code went idle as soon as typing finished, while the
+        voice was still talking."""
+        if self._typing_done and self._speech_done and self.busy:
+            self.mode = "idle"
+            self.busy = False
+            self._ask_started = None
+            try:
+                self.status.config(text="● ONLINE", fg=self.t["good"])
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------ API key (v1.0.6)
+    def _api_key_status_text(self):
+        """Never shows the key — only SET / NOT SET + last 4 chars."""
+        key = os.environ.get("OPENAI_API_KEY", "")
+        if not key:
+            return "Key: NOT SET"
+        return f"Key: SET  •  ****…{key[-4:]}"
+
+    def _refresh_api_key_label(self):
+        try:
+            self.api_key_label.config(text=self._api_key_status_text())
+        except Exception:
+            pass
+
+    def _show_api_key_dialog(self):
+        import tkinter.simpledialog as _sd  # noqa: F401  (kept for symmetry)
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Change API Key")
+        dlg.geometry("460x240")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        tk.Label(dlg, text="Paste your new OpenAI API key below.",
+                 font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=16, pady=(14, 4))
+        tk.Label(dlg, text="It is checked with a quick test call, then saved as a Windows\n"
+                 "User environment variable on this PC only — never in source\ncode, logs, email, or GitHub. The running agent uses it at once.",
+                 font=("Segoe UI", 9), justify="left").pack(anchor="w", padx=16, pady=(0, 8))
+        entry = tk.Entry(dlg, font=("Segoe UI", 11), show="*", width=42)
+        entry.pack(padx=16, fill="x")
+        entry.focus_set()
+        status = tk.Label(dlg, text=self._api_key_status_text(),
+                          font=("Segoe UI", 9, "bold"))
+        status.pack(anchor="w", padx=16, pady=(10, 4))
+        btns = tk.Frame(dlg)
+        btns.pack(padx=16, pady=8, fill="x")
+        save_btn = tk.Button(btns, text="Save key", font=("Segoe UI", 10, "bold"))
+        save_btn.pack(side="left", padx=(0, 8))
+        tk.Button(btns, text="Cancel", font=("Segoe UI", 10),
+                  command=dlg.destroy).pack(side="left")
+
+        def _do_save():
+            new_key = entry.get().strip()
+            if not new_key:
+                status.config(text="Paste a key first.", fg="red")
+                return
+            save_btn.config(state="disabled")
+            status.config(text="Validating the key with OpenAI…", fg="black")
+            def _run():
+                ok, msg = self._validate_api_key(new_key)
+                if ok:
+                    self._set_user_env_var("OPENAI_API_KEY", new_key)
+                    os.environ["OPENAI_API_KEY"] = new_key
+                    self._post_ui(lambda: self._api_key_saved(dlg, status))
+                else:
+                    self._post_ui(lambda: self._api_key_failed(status, save_btn, msg))
+            threading.Thread(target=_run, daemon=True).start()
+        save_btn.config(command=_do_save)
+        dlg.bind("<Return>", lambda _e: _do_save())
+
+    def _api_key_saved(self, dlg, status):
+        status.config(text="Key updated — the new key is active now.", fg="green")
+        self._refresh_api_key_label()
+        self.append("system", "API key updated — the new key is active now. (The key itself is never shown here.)")
+        self._log_listening("API KEY: updated via GUI (key value not logged)")
+        dlg.after(1200, dlg.destroy)
+
+    def _api_key_failed(self, status, save_btn, msg):
+        status.config(text=f"Key invalid — {msg}", fg="red")
+        save_btn.config(state="normal")
+
+    @staticmethod
+    def _validate_api_key(key):
+        """Quick OpenAI test call. Returns (ok, message). The key
+        value is never logged — only the HTTP outcome."""
+        import json as _json
+        import urllib.request as _url
+        try:
+            req = _url.Request(
+                "https://api.openai.com/v1/chat/completions",
+                data=_json.dumps({
+                    "model": "gpt-4o-mini",
+                    "messages": [{"role": "user", "content": "Reply with the single word Pineapple."}],
+                    "max_tokens": 5,
+                }).encode(),
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            )
+            with _url.urlopen(req, timeout=25) as resp:
+                data = _json.loads(resp.read())
+            text = data["choices"][0]["message"]["content"].strip()
+            if "pineapple" in text.lower():
+                return True, "ok"
+            return True, "ok (key accepted)"
+        except Exception as e:
+            return False, f"OpenAI rejected it ({e}). Check the key and try again."
+
+    @staticmethod
+    def _set_user_env_var(name, value):
+        """Persist a User environment variable on Windows (HKCU\\
+        Environment) and broadcast the change, so new processes see
+        it. Falls back to process-only on other platforms."""
+        if sys.platform.startswith("win"):
+            try:
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment",
+                                    0, winreg.KEY_SET_VALUE) as k:
+                    winreg.SetValueEx(k, name, 0, winreg.REG_SZ, value)
+                try:
+                    import ctypes
+                    ctypes.windll.user32.SendMessageTimeoutW(
+                        0xFFFF, 0x001A, 0, "Environment", 0x0002, 5000, None)
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"[gui] Could not persist {name} in registry: {e}")
+        # Process-level, always:
+        os.environ[name] = value
+
+    # ------------------------------------------------------------ avatar-only mode (v1.0.6)
+    def _on_unmap(self, event):
+        """Minimise button -> avatar-only mode. Unmap also fires for
+        other hides; only act when the window is actually iconic."""
+        try:
+            if event.widget is self.root and self.root.state() == "iconic" and not self._avatar_mode:
+                self._enter_avatar_only()
+        except Exception:
+            pass
+
+    def _enter_avatar_only(self):
+        if self._avatar_mode:
+            return
+        self._avatar_mode = True
+        try:
+            self.root.withdraw()
+        except Exception:
+            pass
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        try:
+            win.attributes("-transparentcolor", "#000001")
+        except Exception:
+            pass
+        win.geometry("280x300+200+200")
+        self.avatar_win = win
+        canvas = tk.Canvas(win, width=280, height=260, bg="#000001",
+                           highlightthickness=0)
+        canvas.pack(fill="both", expand=True)
+        self._avatar_canvas = canvas
+        if self.avatar_photo is not None:
+            canvas.create_image(140, 130, image=self.avatar_photo, tags="avatar")
+        else:
+            canvas.create_oval(60, 30, 220, 230, fill=self.t["panel2"],
+                               outline=self.t["accent"], width=2)
+        restore = tk.Button(win, text="⤢  Restore full window",
+                            font=("Segoe UI", 9, "bold"),
+                            command=self._restore_from_avatar)
+        restore.pack(fill="x")
+        # Drag the avatar anywhere on the desktop; a plain click
+        # (no drag) restores the full GUI.
+        def _press(e):
+            self._avatar_drag = (e.x_root, e.y_root, win.winfo_x(), win.winfo_y(), False)
+        def _drag(e):
+            if self._avatar_drag is None:
+                return
+            x0, y0, wx, wy, _moved = self._avatar_drag
+            if abs(e.x_root - x0) > 5 or abs(e.y_root - y0) > 5:
+                self._avatar_drag = (x0, y0, wx, wy, True)
+            win.geometry(f"+{wx + e.x_root - x0}+{wy + e.y_root - y0}")
+        def _release(_e):
+            if self._avatar_drag is not None and not self._avatar_drag[4]:
+                self._restore_from_avatar()
+            self._avatar_drag = None
+        canvas.bind("<Button-1>", _press)
+        canvas.bind("<B1-Motion>", _drag)
+        canvas.bind("<ButtonRelease-1>", _release)
+        win.bind("<Button-3>", lambda _e: self._restore_from_avatar())
+        self._avatar_only_animate()
+
+    def _avatar_only_animate(self):
+        """Keep the avatar's mouth moving in avatar-only mode."""
+        if not self._avatar_mode or self.avatar_win is None:
+            return
+        try:
+            target = self._lip_target_level if self.mode == "speaking" else 0.0
+            self.lip_level += (target - self.lip_level) * (0.45 if target > self.lip_level else 0.25)
+            c = self._avatar_canvas
+            c.delete("mouth")
+            if self.mode == "speaking":
+                mw, mh = self._mouth_dims()
+                c.create_oval(140 - mw, 168 - mh, 140 + mw, 168 + mh,
+                              fill="#40160f", outline="", tags="mouth")
+            self.avatar_win.after(33, self._avatar_only_animate)
+        except Exception:
+            pass
+
+    def _restore_from_avatar(self):
+        if self.avatar_win is not None:
+            try:
+                self.avatar_win.destroy()
+            except Exception:
+                pass
+            self.avatar_win = None
+        self._avatar_mode = False
+        try:
+            self.root.deiconify()
+            self.root.state("normal")
+            self.root.focus_force()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------ actions
     def toggle_speak(self):
@@ -706,6 +1008,27 @@ class OracleGUI:
                 self._post_ui(lambda: self.append("system", "Check done. See the proposals/ folder and any email sent. Reply YES to apply, NO to skip."))
             except Exception as e:
                 self._post_ui(lambda: self.append("system", f"Improvement check failed: {e}"))
+        threading.Thread(target=_run, daemon=True).start()
+
+    def test_camera_gui(self):
+        """Grab one real frame and show where it was saved (v1.0.6).
+        This is the honest camera check — a saved frame, not a guess."""
+        if camera_mod is None:
+            self.append("system", "camera.py not found, or OpenCV is not installed. Run: pip install opencv-python")
+            return
+        self.append("system", "Testing camera — trying every camera index and backend (DirectShow / Media Foundation) until one returns a real frame…")
+        def _run():
+            try:
+                if hasattr(camera_mod, "capture_test_frame"):
+                    ok, result = camera_mod.capture_test_frame()
+                else:
+                    ok, result = False, "capture_test_frame() is not in this camera.py"
+                if ok:
+                    self._post_ui(lambda: self.append("system", f"Camera works — a real frame was grabbed and saved at: {result}"))
+                else:
+                    self._post_ui(lambda: self.append("system", f"Camera test failed: {result}"))
+            except Exception as e:
+                self._post_ui(lambda err=e: self.append("system", f"Camera test failed: {err}"))
         threading.Thread(target=_run, daemon=True).start()
 
     def toggle_watch(self):
@@ -804,6 +1127,8 @@ class OracleGUI:
         if self.busy:
             return
         self.busy = True
+        self._typing_done = False
+        self._speech_done = False
         self._ask_started = datetime.now()
         self.append("user", user_text + ("  [spoken]" if spoken else ""))
         self.history.append({"role": "user", "content": user_text})
@@ -847,7 +1172,15 @@ class OracleGUI:
                 self.mode = "speaking"
                 self.status.config(text="● SPEAKING", fg=self.t["accent"])
                 if self.speak_replies and voice_mod is not None:
-                    voice_mod.speak_async(full_text)
+                    # Fluid lip-sync (v1.0.6): voice.py reports the
+                    # real audio level + phoneme shape as it speaks.
+                    voice_mod.speak_async(
+                        full_text,
+                        on_level=self._on_speech_level,
+                        on_done=lambda: self._post_ui(self._on_speech_done),
+                    )
+                else:
+                    self._speech_done = True
                 self.text.configure(state="normal")
                 self.text.insert("end", f"{AGENT_NAME}: ", "oracle")
                 self.text.configure(state="disabled")
@@ -862,14 +1195,14 @@ class OracleGUI:
                 self.text.configure(state="normal")
                 self.text.insert("end", "\n\n")
                 self.text.configure(state="disabled")
-                self.mode = "idle"
-                self.busy = False
-                self._ask_started = None
-                self.status.config(text="● ONLINE", fg=self.t["good"])
+                self._typing_done = True
+                self._maybe_finish_speaking()
         except Exception as e:
             self._log_listening(f"TYPEWRITER FAILED: {e}")
             self.mode = "idle"
             self.busy = False
+            self._typing_done = True
+            self._speech_done = True
             self._ask_started = None
             try:
                 self.status.config(text="● ONLINE", fg=self.t["good"])
