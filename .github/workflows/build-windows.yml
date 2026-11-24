@@ -24,7 +24,7 @@
 #   - Automatically: pushing a tag like v1.0.2 (git tag v1.0.2 && git push --tags)
 #
 # Outputs (download from the finished run, under "Artifacts"):
-#   - Oracle-windows-v1.0.4.zip — the whole dist/Oracle folder
+#   - Oracle-windows-v1.0.5.zip — the whole dist/Oracle folder
 #
 # What the workflow does NOT do: it does not publish a release, does
 # not test the GUI by clicking it, and does not bundle an OpenAI API
@@ -121,12 +121,12 @@ jobs:
       - name: Zip the one-dir install folder
         shell: pwsh
         run: |
-          Compress-Archive -Path dist\Oracle -DestinationPath Oracle-windows-v1.0.4.zip
-          Get-Item Oracle-windows-v1.0.4.zip | Format-List Name, Length, LastWriteTime
+          Compress-Archive -Path dist\Oracle -DestinationPath Oracle-windows-v1.0.5.zip
+          Get-Item Oracle-windows-v1.0.5.zip | Format-List Name, Length, LastWriteTime
 
       - name: Upload Oracle install zip artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Oracle-windows-v1.0.4-zip
-          path: Oracle-windows-v1.0.4.zip
+          name: Oracle-windows-v1.0.5.zip
+          path: Oracle-windows-v1.0.5.zip
           if-no-files-found: error

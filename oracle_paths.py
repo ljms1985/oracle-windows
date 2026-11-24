@@ -71,15 +71,23 @@ def app_dir():
     return exe_dir()
 
 
-def _find_tcl_dir(meipass, names):
-    """First directory under _MEIPASS that contains init.tcl.
+def _find_tcl_dir(meipass, names, filename):
+    """First directory under _MEIPASS that contains ``filename``.
 
-    Versioned folders first (tcl8.6/tk8.6 — the layout PyInstaller
-    documented), then the _tcl_data/_tk_data roots themselves: if
-    PyInstaller laid Tcl out flat, the root IS the library dir
-    (it contains init.tcl directly) and pointing TCL_LIBRARY there
-    is correct. In a one-dir build PyInstaller's own tkinter hook
-    already sets the variables, so this is belt-and-braces only.
+    ``filename`` matters: Tcl's library dir holds init.tcl, Tk's
+    holds tk.tcl, and they are SEPARATE folders in PyInstaller 6
+    one-dir builds (_internal/_tcl_data/ vs _internal/_tk_data/).
+    Searching for init.tcl when looking for Tk returned _tcl_data
+    as the Tk dir and set TK_LIBRARY to a folder with no tk.tcl —
+    that is exactly the v1.0.4 smoke-test failure ("Can't find a
+    usable tk.tcl", searched _tcl_data, _tcl_data/tk8.6, tk8.6...).
+
+    Versioned folders first (tcl8.6/tk8.6), then the flat data
+    roots themselves: if PyInstaller laid the data out flat, the
+    root IS the library dir. In a one-dir build PyInstaller's own
+    tkinter hook already sets the variables, so this is
+    belt-and-braces only — but it must never point a variable at
+    the wrong library's folder.
     """
     candidates = []
     for name in names:
@@ -88,12 +96,12 @@ def _find_tcl_dir(meipass, names):
         # look one level down inside _tcl_data / _tk_data.
         for parent in ("_tcl_data", "_tk_data", "tcl", "tk"):
             candidates.append(meipass / parent / name)
-    # Flat layout fallback: the data root itself holds init.tcl.
+    # Flat layout fallback: the data root itself holds the file.
     for parent in ("_tcl_data", "_tk_data", "tcl", "tk"):
         candidates.append(meipass / parent)
     for cand in candidates:
         try:
-            if (cand / "init.tcl").is_file():
+            if (cand / filename).is_file():
                 return cand
         except Exception:
             pass
@@ -106,19 +114,22 @@ def fix_tcl():
     Safe to call when unfrozen (does nothing) and safe to call twice.
     Returns True when both libraries were located.
 
-    v1.0.2: only a VERSIONED folder (tcl8.6/tk8.6) is ever used.
-    Pointing TCL_LIBRARY at the _tcl_data/_tk_data root itself was
-    part of the v1.0.1 failure: the spec had flattened a second copy
-    of tcl8.6 into _tcl_data, so the root contained init.tcl but was
-    not a usable Tcl library dir. If no versioned folder is found,
-    leave the variables alone — PyInstaller's own tkinter hook sets
-    them correctly for a one-dir build.
+    v1.0.5: versioned folders first, then the flat data roots —
+    PyInstaller 6.22.3 one-dir puts Tcl flat in
+    _internal/_tcl_data/ (init.tcl) and Tk flat in
+    _internal/_tk_data/ (tk.tcl). Each variable must point at its
+    OWN library's folder: TCL_LIBRARY at the folder holding
+    init.tcl, TK_LIBRARY at the folder holding tk.tcl. Pointing
+    TK_LIBRARY at _tcl_data was the v1.0.4 smoke-test failure.
+    If no folder is found for a library, that variable is left
+    alone — PyInstaller's own tkinter hook sets them correctly
+    for a one-dir build.
     """
     meipass = _meipass()
     if meipass is None:
         return False
-    tcl_dir = _find_tcl_dir(meipass, ("tcl8.6", "tcl8.7", "tcl"))
-    tk_dir = _find_tcl_dir(meipass, ("tk8.6", "tk8.7", "tk"))
+    tcl_dir = _find_tcl_dir(meipass, ("tcl8.6", "tcl8.7", "tcl"), "init.tcl")
+    tk_dir = _find_tcl_dir(meipass, ("tk8.6", "tk8.7", "tk"), "tk.tcl")
     if tcl_dir is not None:
         os.environ["TCL_LIBRARY"] = str(tcl_dir)
     if tk_dir is not None:
