@@ -1,0 +1,82 @@
+# Debug build for Oracle for Windows — console build to capture the real
+# startup traceback (the windowed build only shows PyInstaller's generic
+# "Failed to execute script 'gui'" dialog and hides the traceback).
+#
+# Trigger manually: Actions -> "Debug Oracle for Windows" -> Run workflow
+# It builds Oracle-debug.exe (console=True, same code/datas as the real
+# build), then runs it on the runner for up to 25 seconds, capturing all
+# stdout/stderr to debug-run.log. If tkinter cannot find init.tcl (or any
+# other import/startup error occurs) the traceback lands in that log.
+# If the GUI does start, the run is killed by the timeout — that is a PASS
+# for startup (no traceback), not a failure.
+# The log and the debug exe are uploaded as artifacts for inspection.
+
+name: Debug Oracle for Windows
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug-windows:
+    name: Build console debug exe + capture startup output
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies + PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install "pyinstaller>=6.0"
+
+      - name: Compile-check all Python files
+        run: python -m py_compile agent.py camera.py computer.py design3d.py email_alerts.py gui.py identity.py monitor.py repair.py security.py sms.py voice.py
+
+      - name: Build Oracle-debug.exe with PyInstaller (console)
+        run: |
+          pyinstaller oracle-windows-debug.spec
+          Get-ChildItem dist | Format-List Name, Length
+
+      - name: Check what Tcl/Tk data PyInstaller collected
+        shell: pwsh
+        run: |
+          Write-Host "=== PyInstaller build log: tcl/tk lines ==="
+          Select-String -Path build/Oracle-debug/warn-Oracle-debug.txt -Pattern "tcl|tkinter|_tk_data" -SimpleMatch:$false | Select-Object -First 40
+          Write-Host "=== build/Oracle-debug tree (tcl/tk entries) ==="
+          Get-ChildItem -Recurse build/Oracle-debug | Where-Object { $_.FullName -match 'tcl|tk8|tkinter' } | Select-Object -First 40 FullName
+          Write-Host "=== dist contents ==="
+          Get-ChildItem dist | Format-List Name, Length
+
+      - name: Run Oracle-debug.exe and capture output
+        shell: pwsh
+        run: |
+          $env:ORACLE_SMOKE_TEST = "1"
+          $p = Start-Process -FilePath "dist\Oracle-debug.exe" -RedirectStandardOutput "debug-run.log" -RedirectStandardError "debug-run-err.log" -PassThru -NoNewWindow
+          if (-not $p.WaitForExit(25000)) {
+            "SMOKE RESULT: process was still running after 25s (GUI started, no startup traceback) — killing it." | Out-File -FilePath debug-run.log -Append -Encoding utf8
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          } else {
+            "SMOKE RESULT: process exited with code $($p.ExitCode) after startup attempt." | Out-File -FilePath debug-run.log -Append -Encoding utf8
+          }
+          Write-Host "=== debug-run.log ==="
+          Get-Content debug-run.log -ErrorAction SilentlyContinue
+          Write-Host "=== debug-run-err.log ==="
+          Get-Content debug-run-err.log -ErrorAction SilentlyContinue
+          Copy-Item debug-run-err.log debug-run-combined.log -ErrorAction SilentlyContinue
+          Get-Content debug-run-err.log -ErrorAction SilentlyContinue | Out-File -FilePath debug-run.log -Append -Encoding utf8
+
+      - name: Upload debug log + debug exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: Oracle-debug-log
+          path: |
+            debug-run.log
+            dist/Oracle-debug.exe
+          if-no-files-found: error

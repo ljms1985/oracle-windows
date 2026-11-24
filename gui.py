@@ -737,6 +737,16 @@ class OracleGUI:
 
 
 if __name__ == "__main__":
+    # Headless smoke test (used by the GitHub debug build):
+    # ORACLE_SMOKE_TEST=1 just proves tkinter can start — i.e. that
+    # init.tcl was bundled — without opening the full GUI loop.
+    if os.environ.get("ORACLE_SMOKE_TEST") == "1":
+        _smoke_root = tk.Tk()
+        _smoke_root.withdraw()
+        _smoke_root.update()
+        _smoke_root.destroy()
+        print("SMOKE OK: tkinter started (init.tcl found), Tk created and destroyed cleanly.")
+        sys.exit(0)
     root = tk.Tk()
     OracleGUI(root)
     root.mainloop()
