@@ -1,0 +1,15 @@
+# Oracle for Windows — Python requirements
+# Install with:  pip install -r requirements.txt
+openai
+pyttsx3
+SpeechRecognition
+pyaudio
+opencv-python
+Pillow  # required for the avatar image in gui.py (assets/avatar.png)
+numpy
+trimesh
+playwright
+# Optional, for a standalone .exe build on Windows:
+# pyinstaller
+# Optional, for full face matching (needs dlib; hard on Windows — not required):
+# face_recognition

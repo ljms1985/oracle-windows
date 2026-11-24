@@ -1,0 +1,82 @@
+# Oracle for Windows — GitHub Actions build
+#
+# Builds a standalone, double-clickable Oracle.exe on a real Windows
+# machine in the cloud (GitHub-hosted windows-latest runner). No
+# Windows packaging tools are needed locally to produce the .exe.
+#
+# UNSIGNED BUILD — no signing certificate, no code-signing secrets.
+# On first launch on a real Windows PC, Windows SmartScreen / Defender
+# will likely warn that the app is from an unknown publisher: the user
+# clicks "More info" then "Run anyway". That is expected for an
+# unsigned .exe, not a broken app. A code-signing certificate would be
+# needed later to remove that warning — a separate step, not this build.
+#
+# Triggers:
+#   - Manually: Actions tab -> "Build Oracle for Windows" -> Run workflow
+#   - Automatically: pushing a tag like v1.0.0 (git tag v1.0.0 && git push --tags)
+#
+# Outputs (download from the finished run, under "Artifacts"):
+#   - Oracle.exe — single-file, windowed build of gui.py
+#
+# What the workflow does NOT do: it does not publish a release, does
+# not test the GUI by clicking it, and does not bundle an OpenAI API
+# key — the user adds her own key on first run. A human still needs to
+# open Oracle.exe on a real Windows PC and check the avatar, voice,
+# and camera work there.
+
+name: Build Oracle for Windows
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-windows:
+    name: Build Oracle.exe (Windows, unsigned)
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies + PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install "pyinstaller>=6.0"
+
+      - name: Compile-check all Python files
+        run: python -m py_compile *.py
+
+      - name: Build Oracle.exe with PyInstaller
+        run: pyinstaller oracle-windows.spec
+
+      - name: Verify Oracle.exe is a real Windows PE executable
+        shell: pwsh
+        run: |
+          if (-not (Test-Path dist/Oracle.exe)) { Write-Error "ERROR: dist/Oracle.exe was not built"; exit 1 }
+          $bytes = [System.IO.File]::ReadAllBytes("dist/Oracle.exe")
+          if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { Write-Error "ERROR: Oracle.exe does not start with the MZ header"; exit 1 }
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+          $peSig = [System.Text.Encoding]::ASCII.GetString($bytes, $peOffset, 4)
+          if ($peSig -ne "PE`0`0") { Write-Error "ERROR: Oracle.exe has no PE signature"; exit 1 }
+          $sizeMB = [math]::Round((Get-Item dist/Oracle.exe).Length / 1MB, 1)
+          Write-Host "Oracle.exe verified: PE executable, $sizeMB MB"
+          if (-not (Test-Path dist/Oracle.exe)) { exit 1 }
+          # Avatar must be bundled inside the one-file exe (check the spec datas)
+          Select-String -Path oracle-windows.spec -Pattern "assets/avatar.png" -Quiet | Out-Null
+          Get-Item dist/Oracle.exe | Format-List Name, Length, LastWriteTime
+
+      - name: Upload Oracle.exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Oracle-windows-exe
+          path: dist/Oracle.exe
+          if-no-files-found: error

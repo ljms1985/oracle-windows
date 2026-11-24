@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+workspace/
+credentials/accounts.json
+memory.json
+backups/
+identities/
+proposals/
+alerts/
+repairs/
+dist/
+build/
+*.spec
+!oracle-windows.spec
