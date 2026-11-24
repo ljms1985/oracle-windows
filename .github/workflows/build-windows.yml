@@ -53,7 +53,8 @@ jobs:
           pip install "pyinstaller>=6.0"
 
       - name: Compile-check all Python files
-        run: python -m py_compile *.py
+        # PowerShell does not glob *.py for python, so list the files.
+        run: python -m py_compile agent.py camera.py computer.py design3d.py email_alerts.py gui.py identity.py monitor.py repair.py security.py sms.py voice.py
 
       - name: Build Oracle.exe with PyInstaller
         run: pyinstaller oracle-windows.spec
