@@ -72,7 +72,15 @@ def app_dir():
 
 
 def _find_tcl_dir(meipass, names):
-    """First directory under _MEIPASS that contains init.tcl."""
+    """First directory under _MEIPASS that contains init.tcl.
+
+    Versioned folders first (tcl8.6/tk8.6 — the layout PyInstaller
+    documented), then the _tcl_data/_tk_data roots themselves: if
+    PyInstaller laid Tcl out flat, the root IS the library dir
+    (it contains init.tcl directly) and pointing TCL_LIBRARY there
+    is correct. In a one-dir build PyInstaller's own tkinter hook
+    already sets the variables, so this is belt-and-braces only.
+    """
     candidates = []
     for name in names:
         candidates.append(meipass / name)
@@ -80,6 +88,9 @@ def _find_tcl_dir(meipass, names):
         # look one level down inside _tcl_data / _tk_data.
         for parent in ("_tcl_data", "_tk_data", "tcl", "tk"):
             candidates.append(meipass / parent / name)
+    # Flat layout fallback: the data root itself holds init.tcl.
+    for parent in ("_tcl_data", "_tk_data", "tcl", "tk"):
+        candidates.append(meipass / parent)
     for cand in candidates:
         try:
             if (cand / "init.tcl").is_file():

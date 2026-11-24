@@ -24,7 +24,7 @@
 #   - Automatically: pushing a tag like v1.0.2 (git tag v1.0.2 && git push --tags)
 #
 # Outputs (download from the finished run, under "Artifacts"):
-#   - Oracle-windows-v1.0.2.zip — the whole dist/Oracle folder
+#   - Oracle-windows-v1.0.4.zip — the whole dist/Oracle folder
 #
 # What the workflow does NOT do: it does not publish a release, does
 # not test the GUI by clicking it, and does not bundle an OpenAI API
@@ -67,17 +67,26 @@ jobs:
       - name: Build Oracle (one-dir) with PyInstaller
         run: pyinstaller oracle-windows.spec
 
-      # v1.0.2 gate: verify the Tcl/Tk layout a one-dir build must have.
-      # PyInstaller 6 lays Tcl out FLAT in _tcl_data/ (init.tcl,
-      # encoding/, msgs/ directly inside it) — that is its standard
-      # layout, NOT _tcl_data/tcl8.6/. Same for _tk_data/tk.tcl.
+      # Tcl/Tk layout check — DIAGNOSTIC, not a hard gate on a guessed
+      # path. Two guessed layouts have now both failed the gate:
+      # v1.0.2 expected _tcl_data/tcl8.6/init.tcl, v1.0.3 expected
+      # flat _tcl_data/init.tcl — and the PyInstaller build itself
+      # succeeded both times. So: list the real dist tree, find
+      # init.tcl / tk.tcl ANYWHERE under dist/Oracle, and fail only
+      # if no init.tcl exists at all. The smoke test below is the
+      # real gate — it proves tk.Tk() finds init.tcl in the frozen
+      # build, whatever folder PyInstaller used.
       - name: Verify Tcl/Tk layout in dist/Oracle
         shell: pwsh
         run: |
-          if (-not (Test-Path dist\Oracle\_tcl_data\init.tcl)) { Write-Error "ERROR: dist/Oracle/_tcl_data/init.tcl is missing"; exit 1 }
-          if (-not (Test-Path dist\Oracle\_tk_data\tk.tcl)) { Write-Error "ERROR: dist/Oracle/_tk_data/tk.tcl is missing"; exit 1 }
-          if (-not (Test-Path dist\Oracle\_tcl_data\encoding)) { Write-Error "ERROR: dist/Oracle/_tcl_data/encoding is missing"; exit 1 }
-          Write-Host "Tcl/Tk layout OK: _tcl_data/init.tcl, _tk_data/tk.tcl and _tcl_data/encoding present."
+          Get-ChildItem -Path dist\Oracle -Directory | Select-Object Name | Format-Table -AutoSize | Out-String | Write-Host
+          $tcl = Get-ChildItem -Path dist\Oracle -Recurse -Filter init.tcl -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+          $tk = Get-ChildItem -Path dist\Oracle -Recurse -Filter tk.tcl -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+          Write-Host "init.tcl found at: $($tcl -join ', ')"
+          Write-Host "tk.tcl found at: $($tk -join ', ')"
+          if (-not $tcl) { Write-Error "ERROR: no init.tcl anywhere under dist/Oracle — Tcl data was not bundled"; exit 1 }
+          if (-not $tk) { Write-Error "ERROR: no tk.tcl anywhere under dist/Oracle — Tk data was not bundled"; exit 1 }
+          Write-Host "Tcl/Tk layout OK: init.tcl and tk.tcl are bundled."
 
       # Gate: do NOT ship a build whose tkinter cannot start. Build the
       # console debug exe from the same code/spec and run its smoke test
@@ -112,12 +121,12 @@ jobs:
       - name: Zip the one-dir install folder
         shell: pwsh
         run: |
-          Compress-Archive -Path dist\Oracle -DestinationPath Oracle-windows-v1.0.2.zip
-          Get-Item Oracle-windows-v1.0.2.zip | Format-List Name, Length, LastWriteTime
+          Compress-Archive -Path dist\Oracle -DestinationPath Oracle-windows-v1.0.4.zip
+          Get-Item Oracle-windows-v1.0.4.zip | Format-List Name, Length, LastWriteTime
 
       - name: Upload Oracle install zip artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Oracle-windows-v1.0.2-zip
-          path: Oracle-windows-v1.0.2.zip
+          name: Oracle-windows-v1.0.4-zip
+          path: Oracle-windows-v1.0.4.zip
           if-no-files-found: error
