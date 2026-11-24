@@ -109,6 +109,23 @@ try:
 except Exception:
     repair_mod = None
 
+# Muse-memory import (v1.0.7): Oracle inherits Muse conversations
+# from export files Lorenza provides. Pure stdlib, no network, no
+# credentials — see memory_import.py and MEMORY_SHARING.md.
+try:
+    import memory_import as memory_import
+except Exception:
+    memory_import = None
+
+# Writable home for memory.json / memory_import/: next to Oracle.exe
+# when frozen (same as agent.py's MEMORY_FILE), next to the .py files
+# when running from source.
+try:
+    from oracle_paths import app_dir as _oracle_app_dir
+    APP_DIR = _oracle_app_dir()
+except Exception:
+    APP_DIR = BASE_DIR
+
 
 # ---------------------------------------------------------------- themes
 THEMES = {
@@ -210,6 +227,9 @@ class OracleGUI:
         self._tick_clock()
         self._drain_ui_queue()
 
+        # Muse memory (v1.0.7): pick up any export files dropped in
+        # memory_import/ and say, in one line, what Oracle remembers.
+        self._memory_startup()
         self.append("system", f"{AGENT_NAME} online. Ask me anything — watch the core light up when I answer.")
         if PROVIDER == "openai" and not os.environ.get("OPENAI_API_KEY"):
             self.append("system", "Note: OPENAI_API_KEY is not set yet, so replies will fail until you set it on your PC. See README.md — do not paste the key here.")
@@ -361,6 +381,18 @@ class OracleGUI:
         self.api_key_label.pack(anchor="w", pady=(2, 4))
         self._btn(key_card, "Change API Key", self._show_api_key_dialog).pack(fill="x", pady=2)
         tk.Label(key_card, text="Saved on this PC only. Never in source code, logs, or email.",
+                 font=("Segoe UI", 8), fg=t["muted"], bg=t["panel"],
+                 wraplength=200, justify="left").pack(anchor="w", pady=(2, 0))
+
+        # MEMORY card (v1.0.7) — Muse conversation memory, local only.
+        # Right under API KEY so it is visible on first open.
+        mem_card = self._card(deck, "🧠  MEMORY  •  MUSE")
+        self.memory_label = tk.Label(mem_card, text="Remembered: …", font=("Segoe UI", 9, "bold"),
+                                     fg=t["muted"], bg=t["panel"])
+        self.memory_label.pack(anchor="w", pady=(2, 4))
+        self._btn(mem_card, "Import Muse memory…", self._import_memory_file).pack(fill="x", pady=2)
+        self._btn(mem_card, "What do you remember?", self._show_memory_summary).pack(fill="x", pady=2)
+        tk.Label(mem_card, text="Drop Muse chat exports (.md / .json / .txt) in the memory_import folder next to Oracle.exe — I pick them up at startup. Local only, never uploaded.",
                  font=("Segoe UI", 8), fg=t["muted"], bg=t["panel"],
                  wraplength=200, justify="left").pack(anchor="w", pady=(2, 0))
 
@@ -752,6 +784,85 @@ class OracleGUI:
             self.api_key_label.config(text=self._api_key_status_text())
         except Exception:
             pass
+
+    # ------------------------------------------------------------ memory (v1.0.7)
+    # Muse conversation memory: import files Lorenza provides, keep
+    # them in memory.json next to Oracle.exe, and feed them to the
+    # brain in every reply. Local only — nothing here ever leaves
+    # this PC (see MEMORY_SHARING.md).
+    def _refresh_memory_label(self):
+        try:
+            if memory_import is None:
+                text = "Remembered: unavailable"
+            else:
+                text = f"Remembered: {memory_import.memory_count(APP_DIR)} facts"
+            self.memory_label.config(text=text)
+        except Exception:
+            pass
+
+    def _memory_startup(self):
+        """Auto-import any Muse exports dropped in memory_import/,
+        then one short chat line about what Oracle remembers.
+        Runs on the main thread at startup; the files are small."""
+        if memory_import is None:
+            self.append("system", "Memory import is unavailable (memory_import.py missing) — I only know what is in this chat.")
+            return
+        try:
+            new_count, files = memory_import.auto_import(APP_DIR)
+            total = memory_import.memory_count(APP_DIR)
+        except Exception as e:
+            self.append("system", f"Memory auto-import failed: {e}")
+            return
+        self._refresh_memory_label()
+        if new_count:
+            self.append("system", f"Memory: {new_count} new fact(s) remembered from Muse conversations ({len(files)} file(s): {', '.join(files)}). {total} facts remembered in total. Use Memory > Import to add more.")
+        elif total:
+            self.append("system", f"Memory: {total} facts remembered from Muse conversations and my own memory. Use Memory > Import to add more.")
+        else:
+            self.append("system", "Memory: nothing remembered yet. Drop a Muse chat export (.md / .json / .txt) in the memory_import folder next to Oracle.exe, or use Memory > Import Muse memory… — I will remember it from then on.")
+
+    def _import_memory_file(self):
+        """File dialog -> import in a worker thread -> label + chat line."""
+        if memory_import is None:
+            self.append("system", "Memory import is unavailable (memory_import.py missing).")
+            return
+        import tkinter.filedialog as fd
+        path = fd.askopenfilename(
+            title="Import Muse memory — pick a chat export",
+            filetypes=[("Muse exports", "*.md *.json *.txt"),
+                       ("Markdown", "*.md"), ("JSON", "*.json"),
+                       ("Text", "*.txt"), ("All files", "*.*")])
+        if not path:
+            return
+        self.append("system", f"Importing {Path(path).name}…")
+        def _run():
+            try:
+                new_count = memory_import.import_file(path, APP_DIR)
+                total = memory_import.memory_count(APP_DIR)
+            except Exception as e:
+                self._post_ui(lambda err=e: self.append("system", f"Import failed: {err}"))
+                return
+            def _done():
+                self._refresh_memory_label()
+                name = Path(path).name
+                if new_count:
+                    self.append("system", f"Imported {new_count} new fact(s) from {name} — {total} facts remembered in total.")
+                else:
+                    self.append("system", f"No new facts from {name} — it was already imported, or everything in it I already knew. To add more, drop Muse chat exports (.md / .json / .txt) in the memory_import folder next to Oracle.exe and restart me, or use this Import button again with another export.")
+            self._post_ui(_done)
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _show_memory_summary(self):
+        """Post a short grouped summary of the stored facts in chat."""
+        if memory_import is None:
+            self.append("system", "Memory import is unavailable (memory_import.py missing).")
+            return
+        try:
+            lines = memory_import.memory_summary_lines(APP_DIR, max_lines=40)
+        except Exception as e:
+            self.append("system", f"Could not read memory: {e}")
+            return
+        self.append("system", "What I remember about Lorenza:\n" + "\n".join(lines))
 
     def _show_api_key_dialog(self):
         import tkinter.simpledialog as _sd  # noqa: F401  (kept for symmetry)
@@ -1145,7 +1256,22 @@ class OracleGUI:
             if call_llm is None:
                 reply = "I could not load my brain (agent.py). Make sure agent.py is in the same folder as gui.py."
             else:
-                messages = [{"role": "system", "content": PERSONALITY}] + self.history
+                # Memory (v1.0.7): what Oracle knows about Lorenza,
+                # from Muse conversations and its own memory.json.
+                # Read fresh on the worker thread each time so a
+                # just-imported file is used in the very next reply.
+                memory_text = ""
+                if memory_import is not None:
+                    try:
+                        memory_text = memory_import.load_memory_text(APP_DIR)
+                    except Exception:
+                        memory_text = ""
+                system = PERSONALITY
+                if memory_text:
+                    system += ("\n\nWHAT YOU KNOW ABOUT LORENZA (from Muse conversations "
+                               "and your own memory — use it, refer to it naturally, "
+                               "and continue these open threads):\n" + memory_text)
+                messages = [{"role": "system", "content": system}] + self.history
                 try:
                     reply = call_llm(messages)
                 except Exception as e:

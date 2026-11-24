@@ -61,6 +61,24 @@ implementation built to match that behaviour, not a copy of Muse.
 - Two layers, both plain JSON files on the user's own machine:
   - `memory.json` next to the program (`agent.py`: `MEMORY_FILE`,
     `load_memory` / `save_memory`) — durable facts and preferences.
+  - **Muse memory import (v1.0.7, `memory_import.py`, `gui.py`,
+    `MEMORY_SHARING.md`):** on 2026-11-24 Lorenza authorized Muse
+    to share any/all information with Oracle via the private
+    Tailscale/SSH tunnel only, so Oracle can inherit Muse
+    conversations and memory and handle those threads. Muse chat
+    exports (`.md` / `.json` / `.txt`) go in the `memory_import/`
+    folder next to Oracle (Windows: next to `Oracle.exe`; Mac: next
+    to `Oracle.app`) or are picked with Memory > Import Muse
+    memory…; Oracle auto-imports them at startup, dedupes them
+    against what it already knows, and stores them in `memory.json`
+    under `"imported"` with `"imported_files"` tracking what was
+    already imported — existing facts are never overwritten. The
+    GUI feeds the stored memory into every reply's system prompt
+    (`_ask`) and shows it in the MEMORY card and "What do you
+    remember?". Scope is Muse-to-Oracle only, local on her PC —
+    never GitHub, email to others, or public places; the import log
+    records file, count and date only, never keys or credentials.
+    Browser history is never mined for this.
   - The computer workspace: `workspace/memory/memory.json`,
     `workspace/goals/goals.json`, `workspace/tasks/tasks.json`
     (`computer.py`: `MEMORY_DIR`, `GOALS_DIR`, `TASKS_DIR`) with

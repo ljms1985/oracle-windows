@@ -74,7 +74,7 @@ a = Analysis(
     hiddenimports=[
         'agent', 'computer', 'voice', 'camera', 'monitor',
         'email_alerts', 'identity', 'repair', 'design3d', 'security',
-        'sms', 'oracle_paths',
+        'sms', 'oracle_paths', 'memory_import',
         'PIL', 'PIL.Image', 'PIL.ImageTk',
         'openai', 'numpy', 'trimesh',
     ] + _tk_hidden,
