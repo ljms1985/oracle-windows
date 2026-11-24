@@ -151,7 +151,12 @@ class OracleGUI:
         self.mode = "idle"  # idle, thinking, speaking
         self.phase = 0.0
         self.history = []
-        self.always_listen = False
+        # Always listening is the designed default for this agent:
+        # voice replies, always-listening, NO wake word. It must be
+        # ON from startup, not left OFF behind a button tap — the
+        # running instance shipped with False here, which is exactly
+        # why it was not listening even though the design said it was.
+        self.always_listen = True
         self.speak_replies = True
         self.busy = False
         self.listen_thread = None
@@ -175,6 +180,26 @@ class OracleGUI:
         self.append("system", f"{AGENT_NAME} online. Ask me anything — watch the core light up when I answer.")
         if PROVIDER == "openai" and not os.environ.get("OPENAI_API_KEY"):
             self.append("system", "Note: OPENAI_API_KEY is not set yet, so replies will fail until you set it on your PC. See README.md — do not paste the key here.")
+        # Always listening starts automatically at launch (no wake
+        # word). _start_listening() is a no-op-safe call: it checks
+        # the voice libraries, flips the button/label/pill to ON, and
+        # starts the listen thread.
+        self._start_listening()
+
+    def _log_listening(self, line):
+        """Append one timestamped line to voice-listening.log next to
+        the .exe / .py file, so always-listening can be verified from
+        outside the GUI (process + log, not just the on-screen label)."""
+        try:
+            try:
+                from oracle_paths import exe_dir as _exe_dir
+                log_path = _exe_dir() / "voice-listening.log"
+            except Exception:
+                log_path = Path(__file__).resolve().parent / "voice-listening.log"
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {line}\n")
+        except Exception:
+            pass
 
     # ------------------------------------------------------------ widgets
     def _btn(self, parent, text, command, accent=False, small=False):
@@ -573,25 +598,38 @@ class OracleGUI:
         self.speak_replies = not self.speak_replies
         self.speak_btn.config(text=f"Speak replies: {'ON' if self.speak_replies else 'OFF'}")
 
+    def _start_listening(self):
+        """Turn always-listening ON: mic open, no wake word, listen
+        thread running. Returns True when listening actually started."""
+        if voice_mod is None:
+            self.append("system", "Voice libraries are not installed. Run: pip install pyttsx3 SpeechRecognition PyAudio")
+            self.always_listen = False
+            self._log_listening("LISTENING FAILED: voice module not available")
+            return False
+        self.always_listen = True
+        self.listen_btn.config(text="Always listen: ON", bg=self.t["danger"])
+        self.listen_label.config(text="● LISTENING - mic is on")
+        self.mic_pill.config(text="MIC: ON", fg=self.t["danger"])
+        self.append("system", "Always listening is ON. I will respond to speech with no wake word. Tap the button again to pause it instantly.")
+        self._log_listening("LISTENING STARTED: mic open, no wake word")
+        if self.listen_thread is None or not self.listen_thread.is_alive():
+            self.listen_thread = threading.Thread(target=self._listen_loop, daemon=True)
+            self.listen_thread.start()
+        return True
+
+    def _stop_listening(self):
+        self.always_listen = False
+        self.listen_btn.config(text="Always listen: OFF", bg=self.t["panel2"])
+        self.listen_label.config(text="")
+        self.mic_pill.config(text="MIC: OFF", fg=self.t["muted"])
+        self.append("system", "Always listening is OFF. Mic is no longer being transcribed.")
+        self._log_listening("LISTENING STOPPED by user")
+
     def toggle_listen(self):
-        self.always_listen = not self.always_listen
         if self.always_listen:
-            if voice_mod is None:
-                self.append("system", "Voice libraries are not installed. Run: pip install pyttsx3 SpeechRecognition PyAudio")
-                self.always_listen = False
-                return
-            self.listen_btn.config(text="Always listen: ON", bg=self.t["danger"])
-            self.listen_label.config(text="● LISTENING - mic is on")
-            self.mic_pill.config(text="MIC: ON", fg=self.t["danger"])
-            self.append("system", "Always listening is ON. I will respond to speech with no wake word. Tap the button again to pause it instantly.")
-            if self.listen_thread is None or not self.listen_thread.is_alive():
-                self.listen_thread = threading.Thread(target=self._listen_loop, daemon=True)
-                self.listen_thread.start()
+            self._stop_listening()
         else:
-            self.listen_btn.config(text="Always listen: OFF", bg=self.t["panel2"])
-            self.listen_label.config(text="")
-            self.mic_pill.config(text="MIC: OFF", fg=self.t["muted"])
-            self.append("system", "Always listening is OFF. Mic is no longer being transcribed.")
+            self._start_listening()
 
     def _listen_loop(self):
         while self.always_listen:
@@ -601,6 +639,7 @@ class OracleGUI:
                 continue
             heard = voice_mod.listen_once(timeout=3)
             if heard and self.always_listen:
+                self._log_listening(f"HEARD: {heard}")
                 self.root.after(0, lambda h=heard: self.handle_user_text(h, spoken=True))
 
     def check_improvements(self):
