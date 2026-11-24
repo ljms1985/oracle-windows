@@ -55,7 +55,15 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
+# Frozen (.exe) builds: writable data (memory, workspace, credentials,
+# prints, alerts, ...) must live NEXT TO Oracle.exe, not in PyInstaller's
+# temp _MEIPASS folder (deleted on exit). oracle_paths.app_dir() returns
+# exactly that when frozen, and the source folder when running from source.
+try:
+    from oracle_paths import app_dir as _oracle_app_dir
+    BASE_DIR = _oracle_app_dir()
+except Exception:
+    BASE_DIR = Path(__file__).resolve().parent
 ALERTS_DIR = BASE_DIR / "alerts"
 
 CAMERA_INDEX = int(os.environ.get("CAMERA_INDEX", "0"))

@@ -37,6 +37,18 @@ import os
 import random
 import sys
 import threading
+# BEFORE tkinter: point TCL_LIBRARY / TK_LIBRARY at the bundled Tcl/Tk
+# data inside the frozen bundle (see oracle_paths.py). v1.0.0 crashed
+# on Lorenza's PC with "can't find a usable init.tcl" — this overrides
+# any broken TCL_LIBRARY / TK_LIBRARY already set on that PC, which is
+# the most likely cause given the same build passes the smoke test on
+# the GitHub Windows runner. Must run before `import tkinter`.
+try:
+    from oracle_paths import fix_tcl as _fix_tcl
+    _fix_tcl()
+except Exception:
+    pass
+
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -49,6 +61,14 @@ except Exception:
 
 BASE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE_DIR))
+
+# Bundled read-only resources (avatar, docs): inside sys._MEIPASS when
+# frozen, next to this file when running from source.
+try:
+    from oracle_paths import resource_path as _resource_path
+    RESOURCE_DIR = _resource_path("")
+except Exception:
+    RESOURCE_DIR = BASE_DIR
 
 try:
     import agent as agent_mod
@@ -370,7 +390,7 @@ class OracleGUI:
             print("Avatar: Pillow not available, using drawn head fallback.")
             return
         for rel in ("assets/avatar.png", "avatar.png", "assets/avatar.webp"):
-            path = BASE_DIR / rel
+            path = RESOURCE_DIR / rel
             if path.exists():
                 try:
                     img = Image.open(path).convert("RGBA")
@@ -736,7 +756,30 @@ class OracleGUI:
             self.status.config(text="● ONLINE", fg=self.t["good"])
 
 
-if __name__ == "__main__":
+def _write_crash_log(exc_text):
+    """Write the full traceback next to Oracle.exe (or the .py file).
+
+    The windowed build hides tracebacks behind PyInstaller's generic
+    "Failed to execute script 'gui'" dialog, which is why v1.0.0 was
+    undiagnosable on Lorenza's PC. From v1.0.1 the real traceback is
+    always in Oracle-crash.log next to the .exe.
+    """
+    try:
+        try:
+            from oracle_paths import exe_dir as _exe_dir
+            log_path = _exe_dir() / "Oracle-crash.log"
+        except Exception:
+            log_path = Path(__file__).resolve().parent / "Oracle-crash.log"
+        log_path.write_text(
+            f"Oracle crash — {datetime.now():%Y-%m-%d %H:%M:%S}\n{exc_text}\n",
+            encoding="utf-8",
+        )
+        print(f"Crash traceback written to {log_path}")
+    except Exception:
+        pass
+
+
+def _run_gui():
     # Headless smoke test (used by the GitHub debug build):
     # ORACLE_SMOKE_TEST=1 just proves tkinter can start — i.e. that
     # init.tcl was bundled — without opening the full GUI loop.
@@ -746,7 +789,22 @@ if __name__ == "__main__":
         _smoke_root.update()
         _smoke_root.destroy()
         print("SMOKE OK: tkinter started (init.tcl found), Tk created and destroyed cleanly.")
-        sys.exit(0)
+        return
     root = tk.Tk()
     OracleGUI(root)
     root.mainloop()
+
+
+if __name__ == "__main__":
+    try:
+        _run_gui()
+    except Exception:
+        import traceback
+
+        _exc = traceback.format_exc()
+        _write_crash_log(_exc)
+        # Also print it (visible in the console debug build) and then
+        # re-raise so the windowed build still shows its usual dialog
+        # — but now with Oracle-crash.log next to the .exe to read.
+        print(_exc)
+        raise

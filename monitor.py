@@ -36,7 +36,15 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
+# Frozen (.exe) builds: writable data (memory, workspace, credentials,
+# prints, alerts, ...) must live NEXT TO Oracle.exe, not in PyInstaller's
+# temp _MEIPASS folder (deleted on exit). oracle_paths.app_dir() returns
+# exactly that when frozen, and the source folder when running from source.
+try:
+    from oracle_paths import app_dir as _oracle_app_dir
+    BASE_DIR = _oracle_app_dir()
+except Exception:
+    BASE_DIR = Path(__file__).resolve().parent
 PROPOSALS_DIR = BASE_DIR / "proposals"
 BACKUP_DIR = BASE_DIR / "backups"
 

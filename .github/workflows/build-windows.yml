@@ -54,10 +54,26 @@ jobs:
 
       - name: Compile-check all Python files
         # PowerShell does not glob *.py for python, so list the files.
-        run: python -m py_compile agent.py camera.py computer.py design3d.py email_alerts.py gui.py identity.py monitor.py repair.py security.py sms.py voice.py
+        run: python -m py_compile agent.py camera.py computer.py design3d.py email_alerts.py gui.py identity.py monitor.py oracle_paths.py repair.py rth_tcl.py security.py sms.py voice.py
 
       - name: Build Oracle.exe with PyInstaller
         run: pyinstaller oracle-windows.spec
+
+      # v1.0.1 gate: do NOT ship a windowed build whose tkinter cannot
+      # start. Build the console debug exe from the same code/spec and
+      # run its smoke test — it proves tk.Tk() finds init.tcl. The
+      # windowed build hides tracebacks, so this gate is what catches
+      # a repeat of the v1.0.0 "Failed to execute script 'gui'" crash
+      # before the .exe is released.
+      - name: Smoke-test tkinter startup (console debug build)
+        shell: pwsh
+        run: |
+          pyinstaller oracle-windows-debug.spec
+          $env:ORACLE_SMOKE_TEST = "1"
+          $out = & dist\Oracle-debug.exe 2>&1 | Out-String
+          Write-Host $out
+          if ($out -notmatch "SMOKE OK") { Write-Error "SMOKE TEST FAILED: tkinter did not start in the frozen build"; exit 1 }
+          Write-Host "Smoke test passed: tkinter started in the frozen build."
 
       - name: Verify Oracle.exe is a real Windows PE executable
         shell: pwsh
