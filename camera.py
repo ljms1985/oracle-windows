@@ -90,6 +90,18 @@ MOTION_MIN_AREA = int(os.environ.get("CAMERA_MOTION_MIN_AREA", "5000"))
 ALERT_COOLDOWN_SEC = int(os.environ.get("CAMERA_ALERT_COOLDOWN", "300"))
 
 latest_frame = None  # shared with the GUI preview, if it is open
+# Monotonic counter, bumped on every real frame read. The GUI preview
+# uses it to skip re-rendering when no new frame arrived, so a slow
+# preview timer can never re-draw the same frame and a fast timer
+# never wastes work. (Preview fluidity fix, v1.0.9, 2026-11-24.)
+latest_frame_id = 0
+# Face tags for the preview (v1.0.9): list of (box, name_or_None,
+# confidence) in full-frame pixels, updated by the Watcher about
+# once a second. The GUI draws these on the preview frame itself,
+# so a tag follows the person as they move. Unknown faces carry
+# name=None and are drawn as "Unknown" — never a guessed name.
+latest_faces = []
+latest_faces_at = 0.0
 _latest_lock = threading.Lock()
 
 
@@ -108,10 +120,13 @@ def _cv2():
 # so the GUI message and the test output name the exact failure.
 NO_FRAME_ERROR = "-2147483638 / 0x8000000A"
 
-# Resolutions tried per candidate, best first. 1080p for speed; 4K is
-# available but much heavier for motion + vision, and some backends only
-# yield frames at lower resolutions.
-RESOLUTIONS = [(1920, 1080), (1280, 720), (640, 480)]
+# Resolutions tried per candidate, best first. 720p first since
+# v1.0.9: at 1080p the capture + resize + HOG + face work per frame
+# cost enough that the Watcher loop only delivered ~2-3 fps and the
+# preview played frame-by-frame. 720p is plenty for the preview,
+# motion, tracking and face ID (pan-and-describe still downscales
+# to 960 wide for Vision anyway); 1080p stays as a fallback.
+RESOLUTIONS = [(1280, 720), (1920, 1080), (640, 480)]
 
 
 def _backends(cv2):
@@ -376,9 +391,10 @@ class CameraController:
                     f"different USB port)")
                 return None
         frame = self._apply_digital_ptz(frame)
-        global latest_frame
+        global latest_frame, latest_frame_id
         with _latest_lock:
             latest_frame = frame.copy()
+            latest_frame_id += 1
         return frame
 
     def close(self):
@@ -861,6 +877,13 @@ class Watcher:
                 self._unknown_tracker = None
         self._last_frame = None
         self._frame_count = 0
+        # Preview fluidity (v1.0.9): heavy work is time-throttled in
+        # _loop so it never paces the frame grab. Face ID at most
+        # once a second, tracker update at most ~3x a second; the
+        # capture loop itself runs at camera rate (~30 fps).
+        self._last_face_id_at = 0.0
+        self._last_track_at = 0.0
+        self.last_faces = []  # [(box, name_or_None, conf)] for tags
         self._last_track_report = None
         self._last_track_report_at = 0.0
         self._camera_lost_reported = False
@@ -1015,23 +1038,39 @@ class Watcher:
                             "camera_lost": False,
                             "uvc_ignored": bool(self.tracker.uvc_ignored) if self.tracker else False,
                             "target_name": self.tracker.target_name if self.tracker else None}
+            _now = time.time()
             if self.tracker is not None and self.auto_track:
                 # Face identification is the expensive step: run it
-                # about once a second, not every frame.
+                # at most once a second (time-based, not per-frame —
+                # every-10th-frame was 3 Hz at 30 fps and stalled
+                # the capture loop). Tracking runs at most ~3 Hz
+                # below; between runs the last box/status is reused,
+                # so the preview is never paced by the tracker.
                 identified = []
-                if face_profiles is not None and self._frame_count % 10 == 1:
+                if face_profiles is not None and _now - self._last_face_id_at >= 1.0:
+                    self._last_face_id_at = _now
                     try:
-                        name, conf, box = face_profiles.identify(frame)
-                        if box is not None:
-                            identified = [(box, name, conf)]
-                        if name:
-                            self.last_identified_name = name
-                            self.last_confidence = conf
-                        elif box is not None:
-                            # A face is in view but matches nobody:
-                            # clear any previous identity, count repeats.
+                        # Multi-face: identify EVERY face in frame, not
+                        # just the largest — Lorenza + Adonis are in
+                        # frame together and each needs their own tag.
+                        faces = []
+                        for fbox in face_profiles.detect_faces(frame)[:4]:
+                            fname, fconf, fbox2 = face_profiles.identify(frame, box=fbox)
+                            faces.append((fbox2 or fbox, fname, fconf))
+                        self.last_faces = faces
+                        global latest_faces, latest_faces_at
+                        with _latest_lock:
+                            latest_faces = list(faces)
+                            latest_faces_at = _now
+                        named = [(b, n, c) for (b, n, c) in faces if n]
+                        if named:
+                            self.last_identified_name = named[0][1]
+                            self.last_confidence = named[0][2]
+                        elif faces:
+                            # Face(s) in view but match nobody: unknown.
                             self.last_identified_name = None
                             self.last_confidence = 0.0
+                            box = faces[0][0]
                             if self._unknown_tracker is not None:
                                 is_repeat, count, _b = self._unknown_tracker.note_unknown(frame, box)
                                 self.unknown_seen_count = count
@@ -1042,16 +1081,26 @@ class Watcher:
                                             "Ask who it is, then say 'enrol this person as <name>'.")
                                     except Exception:
                                         pass
+                        else:
+                            self.last_identified_name = None
+                            self.last_confidence = 0.0
+                        identified = faces
                     except Exception:
                         pass
-                track_status = self.tracker.update(
-                    frame, motion_box=motion_box, identified_faces=identified or None)
-                self.last_tracked_box = track_status.get("box")
-                self.last_track_status = track_status.get("action", "idle")
-                if self.last_tracked_box is None:
-                    self.last_identified_name = None
-                    self.last_confidence = 0.0
-                    self.unknown_seen_count = 0
+                if _now - self._last_track_at >= 0.3:
+                    self._last_track_at = _now
+                    track_status = self.tracker.update(
+                        frame, motion_box=motion_box, identified_faces=identified or None)
+                    self.last_tracked_box = track_status.get("box")
+                    self.last_track_status = track_status.get("action", "idle")
+                    if self.last_tracked_box is None:
+                        self.last_identified_name = None
+                        self.last_confidence = 0.0
+                        self.unknown_seen_count = 0
+                else:
+                    track_status = dict(track_status)
+                    track_status["box"] = self.last_tracked_box
+                    track_status["action"] = self.last_track_status
                 track_status["name"] = self.last_identified_name
                 track_status["confidence"] = self.last_confidence
                 track_status["unknown_seen_count"] = self.unknown_seen_count
@@ -1066,7 +1115,7 @@ class Watcher:
                     and now - self.last_alert > ALERT_COOLDOWN_SEC):
                 self.last_alert = now
                 self._alert(frame, motion_area)
-            time.sleep(0.1)
+            time.sleep(0.005)  # was 0.1: capped the loop at 10 fps
 
     def _alert(self, frame, motion_area):
         cv2 = _cv2()

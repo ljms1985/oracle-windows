@@ -1349,21 +1349,71 @@ class OracleGUI:
             frame, text="Camera starting…", font=("Segoe UI", 9),
             fg=self.t["muted"], bg="#000000", width=28, height=7)
         self._cam_preview_label.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        # Preview fluidity (v1.0.9): render counter / fps window, and
+        # the id of the last frame drawn, so unchanged frames are
+        # skipped instead of re-rendered.
+        self._cam_preview_last_id = None
+        self._cam_preview_frames = 0
+        self._cam_preview_fps_t0 = time.time()
         self._update_cam_preview()
 
     def _update_cam_preview(self):
+        # Fluid preview (v1.0.9): 33 ms timer (~30 fps) instead of
+        # 200 ms (5 fps ceiling); resize with OpenCV instead of
+        # Pillow LANCZOS on the GUI thread; skip re-render when the
+        # Watcher has produced no new frame; face name tags are
+        # drawn ON the preview frame (box + name label) from
+        # camera.latest_faces, so a tag follows the person as they
+        # move. Known faces get a green tag, unknown faces "Unknown".
         try:
             frame = None
+            frame_id = None
+            faces = []
+            faces_at = 0.0
             if camera_mod is not None:
                 frame = getattr(camera_mod, "latest_frame", None)
+                frame_id = getattr(camera_mod, "latest_frame_id", None)
+                faces = list(getattr(camera_mod, "latest_faces", []) or [])
+                faces_at = getattr(camera_mod, "latest_faces_at", 0.0) or 0.0
             if frame is not None and Image is not None and self._cam_preview_label is not None:
-                # OpenCV frames are BGR; convert to RGB for Pillow.
-                rgb = frame[:, :, ::-1].copy()
-                img = Image.fromarray(rgb)
-                img = img.resize((224, 126), Image.LANCZOS)
-                photo = ImageTk.PhotoImage(img)
-                self._cam_preview_photo = photo
-                self._cam_preview_label.config(image=photo, text="")
+                if frame_id is not None and frame_id == getattr(self, "_cam_preview_last_id", None):
+                    pass  # no new frame since last draw: skip the work
+                else:
+                    self._cam_preview_last_id = frame_id
+                    try:
+                        import cv2 as _cv2
+                        small = _cv2.resize(frame, (224, 126),
+                                            interpolation=_cv2.INTER_AREA)
+                        fh, fw = frame.shape[:2]
+                        sx, sy = 224.0 / max(fw, 1), 126.0 / max(fh, 1)
+                        if faces and (time.time() - faces_at) < 2.5:
+                            for (bx, by, bw, bh), fname, _conf in faces:
+                                x1, y1 = int(bx * sx), int(by * sy)
+                                x2, y2 = int((bx + bw) * sx), int((by + bh) * sy)
+                                x1, y1 = max(0, x1), max(0, y1)
+                                x2, y2 = min(223, x2), min(125, y2)
+                                label = fname if fname else "Unknown"
+                                colour = (0, 200, 0) if fname else (0, 200, 200)
+                                _cv2.rectangle(small, (x1, y1), (x2, y2), colour, 2)
+                                (tw, th), _ = _cv2.getTextSize(
+                                    label, _cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+                                ly = y1 - 4 if y1 - th - 6 > 0 else y1 + th + 6
+                                _cv2.rectangle(small, (x1, ly - th - 2),
+                                               (x1 + tw + 4, ly + 2), colour, -1)
+                                _cv2.putText(small, label, (x1 + 2, ly),
+                                             _cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                                             (0, 0, 0), 1, _cv2.LINE_AA)
+                        rgb = _cv2.cvtColor(small, _cv2.COLOR_BGR2RGB)
+                        img = Image.fromarray(rgb)
+                    except Exception:
+                        # Fallback if OpenCV is unavailable in the GUI.
+                        rgb = frame[:, :, ::-1].copy()
+                        img = Image.fromarray(rgb)
+                        img = img.resize((224, 126), Image.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                    self._cam_preview_photo = photo
+                    self._cam_preview_label.config(image=photo, text="")
+                    self._cam_preview_frames = getattr(self, "_cam_preview_frames", 0) + 1
             elif self._cam_preview_label is not None:
                 if self.watcher is None:
                     msg = "Camera off" if self._camera_watch_user_stopped else "Camera starting…"
@@ -1377,7 +1427,23 @@ class OracleGUI:
             except Exception:
                 pass
         try:
-            self.root.after(200, self._update_cam_preview)
+            now = time.time()
+            t0 = getattr(self, "_cam_preview_fps_t0", None)
+            if t0 is None:
+                self._cam_preview_fps_t0 = now
+                self._cam_preview_frames = 0
+            elif now - t0 >= 10.0:
+                n = getattr(self, "_cam_preview_frames", 0)
+                fps = n / max(now - t0, 0.001)
+                self._cam_preview_frames = 0
+                self._cam_preview_fps_t0 = now
+                if n > 0:
+                    self._log_listening(
+                        f"PREVIEW FPS: {fps:.1f} (renders in last {now - t0:.0f}s)")
+        except Exception:
+            pass
+        try:
+            self.root.after(33, self._update_cam_preview)
         except Exception:
             pass
 
