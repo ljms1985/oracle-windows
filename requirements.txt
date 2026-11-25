@@ -9,6 +9,9 @@ pyaudio
 # faster-whisper install. Key from OPENAI_API_KEY env var only.
 # Google Speech Recognition (via SpeechRecognition) is the fallback.
 opencv-python==4.11.0.86
+psutil  # CPU clock + utilisation for the Hardware panel (v1.0.9);
+        # hardware_monitor.py still works without it (WMI fallback),
+        # but psutil is cheap and reliable — install it.
 # Pinned to 4.11: opencv-python 5.x removed CascadeClassifier and
 # HOGDescriptor, which camera auto-tracking (tracking.py) and local
 # face detection (face_profiles.py, identity.py) rely on. Do not
@@ -21,3 +24,13 @@ playwright
 # pyinstaller
 # Optional, for full face matching (needs dlib; hard on Windows — not required):
 # face_recognition
+# Optional, for the Hardware panel pump speed / liquid temperature
+# (Kraken Elite 360, 2026-11-24): liquidctl is called as a CLI, not
+# imported — `pip install liquidctl`, or put liquidctl.exe next to
+# Oracle.exe. hardware_monitor.py falls back to the LHM fan sensor
+# when liquidctl is absent or blocked while NZXT CAM holds the Kraken.
+# liquidctl
+# Optional, for the Hardware panel CPU temperature: a portable
+# LibreHardwareMonitor.exe bundled beside Oracle.exe (in a
+# LibreHardwareMonitor/ folder) is auto-started when its WMI sensors
+# are not readable. LHM is free (MPL-2.0); include its licence.

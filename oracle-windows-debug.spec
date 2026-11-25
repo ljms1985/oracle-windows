@@ -63,6 +63,11 @@ a = Analysis(
         ('SECURITY_KNOWLEDGE.md', '.'),
         ('AVATAR_NOTES.md', '.'),
         ('WINDOWS_UPDATE_NOTES.md', '.'),
+        # Personal Windows avatar (Lorenza, 2026-11-24 23:00 EST):
+        # the pencil drawing — gui.py loads avatars/pencil-avatar-orb.jpg
+        # first, falling back to the anime assets/avatar.png. Without
+        # this line a debug build silently falls back to the anime.
+        ('avatars/pencil-avatar-orb.jpg', 'avatars'),
         # Lorenza's chosen Muse avatar (red-and-black anime). gui.py
         # loads assets/avatar.png, falling back to avatar.png — both
         # are bundled so the face shows in the frozen .exe.

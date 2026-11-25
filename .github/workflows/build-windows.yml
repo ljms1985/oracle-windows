@@ -24,7 +24,7 @@
 #   - Automatically: pushing a tag like v1.0.2 (git tag v1.0.2 && git push --tags)
 #
 # Outputs (download from the finished run, under "Artifacts"):
-#   - Oracle-windows-v1.0.7.zip — the whole dist/Oracle folder
+#   - Oracle-windows-v1.0.10.zip — the whole dist/Oracle folder
 #
 # What the workflow does NOT do: it does not publish a release, does
 # not test the GUI by clicking it, and does not bundle an OpenAI API
@@ -62,7 +62,7 @@ jobs:
 
       - name: Compile-check all Python files
         # PowerShell does not glob *.py for python, so list the files.
-        run: python -m py_compile agent.py camera.py computer.py design3d.py email_alerts.py gui.py identity.py monitor.py oracle_paths.py repair.py rth_tcl.py security.py sms.py voice.py
+        run: python -m py_compile agent.py avatar_anim.py avatar_deform.py camera.py computer.py continuous_memory.py design3d.py email_alerts.py face_profiles.py get_to_know.py gui.py hardware_monitor.py identity.py lips.py memory_import.py monitor.py oracle_paths.py repair.py rth_tcl.py security.py sms.py tracking.py voice.py
 
       - name: Build Oracle (one-dir) with PyInstaller
         run: pyinstaller oracle-windows.spec
@@ -121,12 +121,12 @@ jobs:
       - name: Zip the one-dir install folder
         shell: pwsh
         run: |
-          Compress-Archive -Path dist\Oracle -DestinationPath Oracle-windows-v1.0.7.zip
-          Get-Item Oracle-windows-v1.0.7.zip | Format-List Name, Length, LastWriteTime
+          Compress-Archive -Path dist\Oracle -DestinationPath Oracle-windows-v1.0.10.zip
+          Get-Item Oracle-windows-v1.0.10.zip | Format-List Name, Length, LastWriteTime
 
       - name: Upload Oracle install zip artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Oracle-windows-v1.0.7.zip
-          path: Oracle-windows-v1.0.7.zip
+          name: Oracle-windows-v1.0.10.zip
+          path: Oracle-windows-v1.0.10.zip
           if-no-files-found: error

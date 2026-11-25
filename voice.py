@@ -1,9 +1,15 @@
 """
 Voice for Oracle - speak replies and listen continuously, no wake word.
 
-Speech (default): OpenAI TTS, model "tts-1", voice "nova" (warm,
-natural), WAV output, played through PyAudio. The API key is read
-from the OPENAI_API_KEY environment variable; it is never printed,
+Speech: selectable voice engine (2026-11-24, Lorenza): OpenAI TTS
+is the default (model "tts-1", voice "nova", warm, natural, WAV
+output, played through PyAudio). ElevenLabs is the second engine
+("eleven_turbo_v2_5", default voice Daniel — JARVIS-style British
+male, 2026-11-24 22:47 EST) — pick it in the GUI's VOICE card; its
+key comes from the ELEVENLABS_API_KEY environment variable.
+"System" uses the offline Windows SAPI voice. The engine choice is
+stored in oracle_settings.json next to Oracle.exe, so it survives
+restarts. Keys are read from the environment; they are never printed,
 logged, or stored - only presence / non-empty checks are done.
 
 Lip-sync: while a WAV is playing, each chunk's real RMS amplitude is
@@ -15,7 +21,9 @@ elapsed time vs. the chunk's total duration and the words' lengths.
 It is not measured from the audio itself.
 
 Fallbacks, in order - speak() never raises into the GUI thread:
-  1. OpenAI TTS (when a key is set and PyAudio is available).
+  1. The selected voice engine (OpenAI TTS by default; ElevenLabs
+     when picked in the GUI and its key is set; System voice when
+     picked). A failing cloud engine falls through to the next one.
   2. pyttsx3 / Windows SAPI, with an estimated envelope (a smoothed
      sine driven by word timing) fed to on_level so lip-sync still
      moves even though there is no real audio to measure.
@@ -78,6 +86,19 @@ import urllib.request
 import uuid
 import wave
 
+# Voice-engine / key settings live in oracle_settings.json next to
+# Oracle.exe (see oracle_paths.py). Guarded: voice.py also runs
+# standalone in tests, where settings simply do not persist.
+try:
+    from oracle_paths import get_setting as _get_setting
+    from oracle_paths import set_setting as _set_setting
+except Exception:
+    def _get_setting(key, default=None):
+        return default
+
+    def _set_setting(key, value):
+        return value
+
 # ---------------------------------------------------------------- config
 
 OPENAI_TTS_URL = "https://api.openai.com/v1/audio/speech"
@@ -88,6 +109,102 @@ _TTS_TIMEOUT = 60                  # seconds per TTS request
 _MAX_CHUNK_CHARS = 800             # split long replies into ~sentence chunks
 _SENTENCE_PAUSE = 0.28             # seconds of silence between sentences
 _SAPI_WORDS_PER_MINUTE = 175       # matches the old SAPI rate=175
+
+# ---------------------------------------------------------------- ElevenLabs (second voice engine, 2026-11-24)
+# Key: ELEVENLABS_API_KEY env var (Lorenza's PC already has one,
+# 51 chars, previously unused by any Oracle code). The API returns
+# raw PCM, so _fetch_elevenlabs_wav wraps it in a WAV header with
+# stdlib `wave` — the existing _play_wav_bytes then plays it
+# unchanged, with the same live RMS lip-sync levels.
+ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+ELEVENLABS_USER_URL = "https://api.elevenlabs.io/v1/user"
+ELEVENLABS_MODEL = "eleven_turbo_v2_5"
+# JARVIS voice (Lorenza, 2026-11-24 22:47 EST): Daniel — British,
+# middle-aged, authoritative, the standard JARVIS-style pick in
+# ElevenLabs' own default-voice list (use case: news). Refined,
+# calm, precise diction, unhurried, warm but formal — the butler
+# register. This is a JARVIS-STYLE voice, NOT an imitation of any
+# actor's voice (never clone Paul Bettany or anyone real).
+# Warmer alternative, same register: George (JBFqnCBsd6RMkjVDRZzb)
+# — Lorenza can swap the id in the GUI's ElevenLabs Voice ID field.
+ELEVENLABS_DEFAULT_VOICE_ID = "onwK4e9ZLuTAKqWW03F9"  # Daniel
+ELEVENLABS_VOICE_GEORGE = "JBFqnCBsd6RMkjVDRZzb"  # George (warmer alt)
+ELEVENLABS_PCM_RATE = 44100
+
+# Selectable voice engine, stored in oracle_settings.json:
+# "openai" (default, nova), "elevenlabs", "system" (offline SAPI).
+VOICE_ENGINES = ("openai", "elevenlabs", "system")
+VOICE_ENGINE_LABELS = {
+    "openai": "OpenAI (nova)",
+    "elevenlabs": "ElevenLabs",
+    "system": "System voice",
+}
+
+
+def get_voice_engine():
+    """Selected voice engine ("openai" unless the GUI picked another)."""
+    engine = _get_setting("voice_engine", "openai")
+    return engine if engine in VOICE_ENGINES else "openai"
+
+
+def set_voice_engine(engine):
+    """Persist the voice-engine choice. Raises ValueError on a bad name."""
+    if engine not in VOICE_ENGINES:
+        raise ValueError(f"Unknown voice engine: {engine!r}")
+    return _set_setting("voice_engine", engine)
+
+
+def get_elevenlabs_voice_id():
+    """ElevenLabs voice id (default Daniel — JARVIS-style British
+    male) — editable in the GUI."""
+    vid = (_get_setting("elevenlabs_voice_id",
+                        ELEVENLABS_DEFAULT_VOICE_ID) or "").strip()
+    return vid or ELEVENLABS_DEFAULT_VOICE_ID
+
+
+def set_elevenlabs_voice_id(voice_id):
+    """Persist the ElevenLabs voice id (blank resets to the default)."""
+    vid = (voice_id or "").strip() or ELEVENLABS_DEFAULT_VOICE_ID
+    return _set_setting("elevenlabs_voice_id", vid)
+
+
+def validate_elevenlabs_key(key):
+    """Check an ElevenLabs key: format first, then a live GET
+    /v1/user (free — uses no TTS quota). Returns (ok, message).
+    The key value is never logged — only the HTTP outcome."""
+    k = (key or "").strip().strip('"').strip("'").strip()
+    if not k:
+        return False, "no key entered."
+    if any(c.isspace() for c in k):
+        return False, "the key has a space in it — paste the bare key."
+    if not k.startswith("sk_") or len(k) < 20:
+        return False, "that does not look like an ElevenLabs key (they start with sk_)."
+    try:
+        req = urllib.request.Request(
+            ELEVENLABS_USER_URL, headers={"xi-api-key": k}, method="GET")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp.read()
+        return True, "ok"
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return False, "ElevenLabs rejected it (401) — check the key and try again."
+        return False, f"ElevenLabs returned HTTP {e.code} — the key could not be checked."
+    except Exception as e:
+        return False, f"could not reach ElevenLabs ({e}) — check internet and try again."
+
+
+def validate_extra_key(key):
+    """Format-only check for the spare key slot (its service is not
+    known yet, so there is nothing live to check against). A bad
+    format is still refused; a good format is saved as-is."""
+    k = (key or "").strip()
+    if not k:
+        return False, "no key entered."
+    if any(c.isspace() for c in k):
+        return False, "the key has whitespace in it — paste the bare key."
+    if len(k) < 16:
+        return False, "that looks too short for an API key (under 16 characters)."
+    return True, "ok (format only — this slot has no service to check against yet)"
 
 # Smoothing: attack fast, release slower (level rises quickly, falls gently).
 _ALPHA_ATTACK = 0.6
@@ -215,21 +332,25 @@ def _split_sentences(text):
 def _shape_for_word(word, level):
     """Estimate a mouth shape for the word currently being spoken.
 
-    ESTIMATE ONLY - guessed from the word's vowels, not from audio:
+    ESTIMATE ONLY - guessed from the word's letters, not from audio:
       * level near zero            -> "closed"
+      * word starts with F / V / PH -> "fv" (teeth on lower lip)
       * word dominated by O / U    -> "round"
-      * word dominated by A / E    -> "wide"
+      * word dominated by A / E / I -> "wide"
       * otherwise, quiet           -> "slight", louder -> "open"
     ``level`` here is the real smoothed RMS level.
     """
     if level < 0.04:
         return "closed"
-    w = (word or "").lower()
+    w = (word or "").lower().strip(".,!?\"'")
+    if w.startswith(("f", "v", "ph")):
+        return "fv"
     vowels = [c for c in w if c in "aeiou"]
     if not vowels:
         return "slight" if level < 0.18 else "open"
     round_count = vowels.count("o") + vowels.count("u")
-    wide_count = vowels.count("a") + vowels.count("e")
+    wide_count = (vowels.count("a") + vowels.count("e")
+                  + vowels.count("i"))
     if round_count > wide_count:
         return "round"
     if wide_count > round_count:
@@ -429,6 +550,77 @@ def _speak_openai(text, on_level, stop_event):
             _pause_between_sentences(on_level, stop_event)
 
 
+# ---------------------------------------------------------------- ElevenLabs TTS (urllib, no `elevenlabs` package)
+
+def _fetch_elevenlabs_wav(text_chunk):
+    """One ElevenLabs TTS request. Returns WAV bytes. Raises on failure.
+
+    The API returns raw 16-bit mono PCM at 44100 Hz, so it is wrapped
+    in a WAV header with stdlib `wave` — _play_wav_bytes then plays
+    it unchanged. The API key is read from the environment and sent
+    only as the xi-api-key header. It is never printed, logged, or
+    stored.
+    """
+    key = os.environ.get("ELEVENLABS_API_KEY", "")
+    if not key:
+        raise RuntimeError("ELEVENLABS_API_KEY is not set")
+    voice_id = get_elevenlabs_voice_id()
+    payload = json.dumps({
+        "text": text_chunk,
+        "model_id": ELEVENLABS_MODEL,
+        # JARVIS delivery (Lorenza, 2026-11-24 22:47 EST): steady
+        # and unhurried — stability a touch higher than neutral so
+        # the butler register holds, style kept low so it stays
+        # restrained rather than theatrical.
+        "voice_settings": {"stability": 0.6, "similarity_boost": 0.75,
+                           "style": 0.15, "use_speaker_boost": True},
+    }).encode("utf-8")
+    url = (ELEVENLABS_TTS_URL.format(voice_id=voice_id)
+           + "?output_format=pcm_44100")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"xi-api-key": key, "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=_TTS_TIMEOUT) as resp:
+            pcm = resp.read()
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"ElevenLabs TTS request failed (HTTP {e.code})") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"ElevenLabs TTS request failed ({e.reason})") from e
+    if not pcm:
+        raise RuntimeError("ElevenLabs returned no audio")
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(ELEVENLABS_PCM_RATE)
+        wf.writeframes(pcm)
+    return buf.getvalue()
+
+
+def _speak_elevenlabs(text, on_level, stop_event):
+    """ElevenLabs engine: same chunking / playback / pauses as OpenAI,
+    so lip-sync levels and sentence pauses behave identically.
+    Raises on failure (caller falls back)."""
+    chunks = _split_sentences(text)
+    if not chunks:
+        return
+    for i, chunk in enumerate(chunks):
+        if stop_event.is_set():
+            return
+        wav_bytes = _fetch_elevenlabs_wav(chunk)
+        if stop_event.is_set():
+            return
+        played = _play_wav_bytes(wav_bytes, chunk, on_level, stop_event)
+        if not played:
+            return
+        if i < len(chunks) - 1:
+            _pause_between_sentences(on_level, stop_event)
+
+
 # ---------------------------------------------------------------- SAPI fallback (estimated envelope)
 
 def _speak_sapi_fallback(text, on_level, stop_event):
@@ -507,11 +699,13 @@ def _speak_sapi_fallback(text, on_level, stop_event):
 def speak(text, on_level=None, on_done=None):
     """Speak text aloud - synchronous (blocks until done or stopped).
 
-    Default: OpenAI TTS ("nova"). Fallbacks, in order, never raise:
-    (a) OpenAI fails / no key / PyAudio missing -> pyttsx3 SAPI with
-    an estimated envelope; (b) that fails -> print a clear error and
-    return. ``on_level(level, shape)`` is called from the playback
-    thread; ``on_done()`` is called once at the end, whatever happened.
+    Engine is the GUI's VOICE-card choice (get_voice_engine()):
+    "openai" (default, nova), "elevenlabs", or "system" (offline
+    SAPI). A failing cloud engine falls through to the next one, so
+    a bad ElevenLabs key never leaves Oracle silent — it falls back
+    to OpenAI, then SAPI. ``on_level(level, shape)`` is called from
+    the playback thread; ``on_done()`` is called once at the end,
+    whatever happened.
     """
     if not text or not str(text).strip():
         if on_done is not None:
@@ -524,15 +718,36 @@ def speak(text, on_level=None, on_done=None):
     _set_speaking(True)
     _set_level(0.0)
     try:
-        key_present = bool(os.environ.get("OPENAI_API_KEY", ""))
-        if key_present:
-            try:
-                _speak_openai(text, on_level, stop_event)
-                return
-            except Exception as e:
-                print(f"[voice] OpenAI TTS failed ({e}) - falling back to SAPI.")
-        else:
-            print("[voice] OPENAI_API_KEY is not set - using SAPI fallback.")
+        engine = get_voice_engine()
+        if engine == "system":
+            # System voice only — skip the cloud engines entirely.
+            pass
+        elif engine == "elevenlabs":
+            if os.environ.get("ELEVENLABS_API_KEY", ""):
+                try:
+                    _speak_elevenlabs(text, on_level, stop_event)
+                    return
+                except Exception as e:
+                    print(f"[voice] ElevenLabs TTS failed ({e}) - falling back to OpenAI.")
+            else:
+                print("[voice] ElevenLabs engine selected but ELEVENLABS_API_KEY is not set - falling back to OpenAI.")
+            if os.environ.get("OPENAI_API_KEY", ""):
+                try:
+                    _speak_openai(text, on_level, stop_event)
+                    return
+                except Exception as e:
+                    print(f"[voice] OpenAI TTS failed ({e}) - falling back to SAPI.")
+            else:
+                print("[voice] OPENAI_API_KEY is not set - using SAPI fallback.")
+        else:  # "openai" (default)
+            if os.environ.get("OPENAI_API_KEY", ""):
+                try:
+                    _speak_openai(text, on_level, stop_event)
+                    return
+                except Exception as e:
+                    print(f"[voice] OpenAI TTS failed ({e}) - falling back to SAPI.")
+            else:
+                print("[voice] OPENAI_API_KEY is not set - using SAPI fallback.")
         try:
             _speak_sapi_fallback(text, on_level, stop_event)
         except Exception as e:

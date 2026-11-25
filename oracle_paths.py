@@ -26,6 +26,7 @@ itself, belt and braces, in both the runtime hook (rth_tcl.py) and
 gui.py before the tkinter import.
 """
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -62,13 +63,126 @@ def resource_path(rel):
     return Path(__file__).resolve().parent / rel
 
 
+# ------------------------------------------------------------ data drive
+# Dedicated Oracle data drive (2026-11-24, Lorenza): she wants the
+# program's memory on its own drive if there is room — there is
+# (MSI MPG X670E Carbon WiFi: 4x M.2, only 1 NVMe fitted, 3 free;
+# suggested 1TB Gen4 NVMe, NTFS, its own letter — far more than
+# memory will ever need; nothing is bought without her approval).
+# When set, memory.json, memory_import/, alerts/, logs, face
+# profiles and get-to-know-you profiles live on that drive instead
+# of next to Oracle.exe. Default (nothing set) stays next to the
+# exe, so existing installs do not break.
+SETTINGS_FILE_NAME = "oracle_settings.json"
+
+
+def settings_path():
+    """oracle_settings.json always lives next to the exe — it holds
+    the data-drive choice itself, so it can never live ON the data
+    drive (chicken-and-egg)."""
+    return exe_dir() / SETTINGS_FILE_NAME
+
+
+def _valid_data_dir(path):
+    """A usable data dir: an existing directory, or one we can
+    create. Returns the Path, or None (never raises)."""
+    if not path:
+        return None
+    try:
+        p = Path(str(path)).expanduser()
+        p.mkdir(parents=True, exist_ok=True)
+        if p.is_dir():
+            return p
+    except Exception:
+        return None
+    return None
+
+
+def data_dir():
+    """Writable home for user data, honouring the dedicated drive.
+
+    Priority: ORACLE_DATA_DIR env var, then the data_dir saved in
+    oracle_settings.json (set from the GUI), then next to the exe.
+    A set-but-unusable path falls back silently to the exe folder
+    — Oracle must never fail to start over a bad drive letter.
+    """
+    env = _valid_data_dir(os.environ.get("ORACLE_DATA_DIR"))
+    if env is not None:
+        return env
+    try:
+        settings = json.loads(settings_path().read_text(encoding="utf-8"))
+        saved = _valid_data_dir(settings.get("data_dir"))
+        if saved is not None:
+            return saved
+    except Exception:
+        pass
+    return exe_dir()
+
+
+def set_data_dir(path):
+    """Point Oracle at a dedicated data drive and persist the choice
+    in oracle_settings.json next to the exe. Returns the Path used.
+    Raises ValueError when the path cannot be created/used. Takes
+    effect on the next Oracle restart (APP_DIR is fixed at import).
+    """
+    valid = _valid_data_dir(path)
+    if valid is None:
+        raise ValueError(f"Cannot use {path!r} as the Oracle data drive.")
+    try:
+        settings = _read_settings()
+        settings["data_dir"] = str(valid)
+        _write_settings(settings)
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"Could not save the data-drive setting: {e}")
+    return valid
+
+
+# ------------------------------------------------------------ generic settings
+# Small user preferences that live in the same oracle_settings.json
+# next to the exe (voice engine, ElevenLabs voice id, the spare-key
+# label). Never credentials: keys live in User env vars (Windows)
+# or the Keychain (Mac), never in this file.
+
+def _read_settings():
+    """The settings dict, or {} when the file is missing/broken."""
+    try:
+        settings = json.loads(settings_path().read_text(encoding="utf-8"))
+        if isinstance(settings, dict):
+            return settings
+    except Exception:
+        pass
+    return {}
+
+
+def _write_settings(settings):
+    settings_path().write_text(
+        json.dumps(settings, indent=2), encoding="utf-8")
+
+
+def get_setting(key, default=None):
+    """One preference from oracle_settings.json (default when absent)."""
+    return _read_settings().get(key, default)
+
+
+def set_setting(key, value):
+    """Persist one preference in oracle_settings.json. Returns value."""
+    settings = _read_settings()
+    settings[key] = value
+    _write_settings(settings)
+    return value
+
+
 def app_dir():
     """Writable home for user data (memory, workspace, credentials, ...).
 
-    Frozen: next to Oracle.exe, so data persists. Source: next to the
-    .py files, as before.
+    Frozen: next to Oracle.exe, so data persists — unless a
+    dedicated data drive is set (see data_dir()), in which case
+    user data lives there. Source: next to the .py files, as
+    before, unless a data drive is set.
     """
-    return exe_dir()
+    return data_dir()
 
 
 def _find_tcl_dir(meipass, names, filename):

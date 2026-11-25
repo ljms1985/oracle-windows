@@ -53,6 +53,7 @@ Run alone for a test:
 """
 
 import base64
+import json
 import os
 import threading
 import time
@@ -69,6 +70,88 @@ try:
 except Exception:
     BASE_DIR = Path(__file__).resolve().parent
 ALERTS_DIR = BASE_DIR / "alerts"
+
+# ------------------------------------------------------------ camera home position
+# (2026-11-24, Lorenza — CORRECTED 22:12-22:13 EST, supersedes the
+# 22:01 "current position is home" rule): home is FIXED at directly
+# forward — pan centred, tilt level — facing the individual in the
+# chair directly in front of the computer monitor. The chair at the
+# desk is the reference, not an abstract centre. The camera must
+# NEVER be left stuck facing a wall, the ceiling, or the floor.
+# Home NEVER moves: deliberate PTZ moves are temporary and must NOT
+# update it, and no sweep or tracking move updates it either. The
+# only way home changes is an explicit calibration: with Lorenza
+# sitting in the chair, the forward pan/tilt that frames her is
+# saved once (save_camera_home, via the "set this as home" voice
+# command) and then never changed again without her saying so.
+# Stored in oracle_settings.json next to Oracle.exe (the same file
+# that holds the data-drive choice). With no calibration saved yet,
+# home is pan 0, tilt 0, zoom 1.0, crop centred.
+DEFAULT_HOME = {"pan": 0, "tilt": 0, "zoom": 1.0,
+                "crop_x": 0.5, "crop_y": 0.5}
+_HOME_SETTINGS_PATH_OVERRIDE = None  # tests only
+
+
+def _home_settings_path():
+    if _HOME_SETTINGS_PATH_OVERRIDE is not None:
+        return Path(_HOME_SETTINGS_PATH_OVERRIDE)
+    try:
+        from oracle_paths import settings_path as _settings_path
+        return Path(_settings_path())
+    except Exception:
+        return BASE_DIR / "oracle_settings.json"
+
+
+def load_camera_home(settings_path=None):
+    """Saved home position, or None when none is saved / the file
+    is missing or unreadable. Values are clamped to the ranges
+    CameraController.ptz() accepts. Never raises."""
+    path = Path(settings_path) if settings_path is not None \
+        else _home_settings_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        home = data.get("camera_home") if isinstance(data, dict) else None
+        if not isinstance(home, dict):
+            return None
+        return {
+            "pan": max(-155, min(155, float(home.get("pan", 0)))),
+            "tilt": max(-90, min(90, float(home.get("tilt", 0)))),
+            "zoom": max(1.0, min(1.5, float(home.get("zoom", 1.0)))),
+            "crop_x": max(0.0, min(1.0, float(home.get("crop_x", 0.5)))),
+            "crop_y": max(0.0, min(1.0, float(home.get("crop_y", 0.5)))),
+        }
+    except Exception:
+        return None
+
+
+def save_camera_home(position, settings_path=None):
+    """Persist ``position`` (pan/tilt/zoom/crop_x/crop_y) as the
+    FIXED home — calibration only, called explicitly ("set this as
+    home"), NEVER automatically from a move or a sweep. Returns the
+    saved dict, or None when the file could not be written. Never
+    raises."""
+    path = Path(settings_path) if settings_path is not None \
+        else _home_settings_path()
+    try:
+        saved = {
+            "pan": max(-155, min(155, float(position.get("pan", 0)))),
+            "tilt": max(-90, min(90, float(position.get("tilt", 0)))),
+            "zoom": max(1.0, min(1.5, float(position.get("zoom", 1.0)))),
+            "crop_x": max(0.0, min(1.0, float(position.get("crop_x", 0.5)))),
+            "crop_y": max(0.0, min(1.0, float(position.get("crop_y", 0.5)))),
+        }
+        data = {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {}
+        except Exception:
+            data = {}
+        data["camera_home"] = saved
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        return saved
+    except Exception:
+        return None
 
 # Auto-tracking + local face recognition (v1.0.8, items 7/9) — ported
 # from the Mac build. Both are OpenCV-only by default and degrade
@@ -95,11 +178,13 @@ latest_frame = None  # shared with the GUI preview, if it is open
 # preview timer can never re-draw the same frame and a fast timer
 # never wastes work. (Preview fluidity fix, v1.0.9, 2026-11-24.)
 latest_frame_id = 0
-# Face tags for the preview (v1.0.9): list of (box, name_or_None,
-# confidence) in full-frame pixels, updated by the Watcher about
-# once a second. The GUI draws these on the preview frame itself,
-# so a tag follows the person as they move. Unknown faces carry
-# name=None and are drawn as "Unknown" — never a guessed name.
+# Identified faces (internal only, 2026-11-24 22:02 — face tags
+# CANCELLED): list of (box, name_or_None, confidence) in full-frame
+# pixels, updated by the Watcher about once a second. Used ONLY for
+# tracking-target preference and the status line ("Tracking:
+# Lorenza"). NOTHING is ever drawn from this on the preview frame —
+# recognition stays invisible in the background; no boxes, no name
+# tags. Unknown faces carry name=None and are never given a name.
 latest_faces = []
 latest_faces_at = 0.0
 _latest_lock = threading.Lock()
@@ -422,6 +507,51 @@ class CameraController:
                           "and Oracle will use digital framing + the camera's own AI tracking.")
         return result
 
+    def current_position(self):
+        """Current pan/tilt/zoom + digital-crop centre, as a dict."""
+        return {"pan": self.pan, "tilt": self.tilt, "zoom": self.zoom,
+                "crop_x": self.crop_x, "crop_y": self.crop_y}
+
+    def save_home(self):
+        """Save the current position as the FIXED home (calibration
+        only — explicit "set this as home", never called from a
+        move or a sweep). Returns the saved dict or None."""
+        return save_camera_home(self.current_position())
+
+    def go_home(self):
+        """Return the camera to its FIXED home: directly forward,
+        facing the chair in front of the monitor (the saved
+        calibration when one exists, else pan 0 / tilt 0 / zoom
+        1.0 / crop centred). Moves via ptz() so the UVC motor is
+        tried and the digital state follows either way. Returns
+        (position, was_calibrated) — was_calibrated False means
+        the default forward position was used because no
+        calibration is saved yet. Never raises."""
+        try:
+            home = load_camera_home()
+            was_calibrated = home is not None
+            if home is None:
+                home = dict(DEFAULT_HOME)
+            self.ptz(pan_delta=home["pan"] - self.pan,
+                     tilt_delta=home["tilt"] - self.tilt,
+                     zoom_delta=home["zoom"] - self.zoom)
+            self.crop_x = home["crop_x"]
+            self.crop_y = home["crop_y"]
+            return self.current_position(), was_calibrated
+        except Exception:
+            return self.current_position(), False
+
+    def is_at_home(self, pan_tol=25, tilt_tol=20):
+        """True when the camera is already (nearly) home — used by
+        the idle guard, which brings it back when it is found
+        pointing at a wall / ceiling / floor while idle."""
+        try:
+            home = load_camera_home() or DEFAULT_HOME
+            return (abs(self.pan - home["pan"]) <= pan_tol
+                    and abs(self.tilt - home["tilt"]) <= tilt_tol)
+        except Exception:
+            return True
+
     def privacy_mode(self):
         """Stop framing on people and tilt down if the motor allows it."""
         try:
@@ -502,6 +632,29 @@ PAN_SWEEP_STOPS = 5         # capture positions per leg (far left..far right)
 PAN_SETTLE_SEC = 0.9        # wait after each move for the motor / frame to settle
 PAN_VISION_MAX_WIDTH = 960  # frames are downscaled to this width for vision
 PAN_POSITION_LABELS = ("far left", "left", "centre", "right", "far right")
+
+# One sweep at a time, ever: the commanded pan-and-describe and the
+# Watcher's automatic minute sweep share this lock, so they can
+# never move the camera against each other. pan_and_describe holds
+# it for its whole run; the minute sweep takes it non-blocking and
+# defers when it is busy.
+_SWEEP_LOCK = threading.Lock()
+
+# Automatic minute sweep (Lorenza, 2026-11-24 22:12 EST): while
+# camera watch is on, the camera pans FULLY left-to-right and
+# right-to-left every minute, smooth and steady, feeding the visual
+# memory log. It must NOT yank away from a person being tracked
+# (defer until tracking releases), never during a "what do you
+# see?" describe sweep or an alert description, and must return
+# to its saved home position (or resume tracking) afterwards.
+# No Vision call is made on a minute sweep — that would be an
+# OpenAI call every minute. The sweep samples the Watcher's own
+# 1 Hz face identification at each stop instead, and logs who /
+# whether anyone was seen at each position, noting what changed
+# since the previous sweep.
+MINUTE_SWEEP_INTERVAL_SEC = 60.0   # between completed sweeps
+MINUTE_SWEEP_DEFER_SEC = 15.0      # retry delay when it must defer
+MINUTE_SWEEP_SETTLE_SEC = 0.9      # wait after each move (as pan-and-describe)
 
 # Phrases that mean "pan the camera and describe everything you see".
 # Matched by gui.py _ask() (and the CLI) before the LLM is called.
@@ -640,6 +793,10 @@ def pan_and_describe(controller=None, steps=PAN_SWEEP_STOPS,
             except Exception:
                 pass
 
+    # One sweep at a time: wait for any automatic minute sweep to
+    # finish before moving the camera (it holds _SWEEP_LOCK for
+    # ~10 s at most, and always releases it).
+    _SWEEP_LOCK.acquire()
     own_controller = controller is None
     if controller is None:
         controller = CameraController()
@@ -795,6 +952,10 @@ def pan_and_describe(controller=None, steps=PAN_SWEEP_STOPS,
                 "run_dir": str(run_dir), "start_pan": start_pan,
                 "error": None}
     finally:
+        try:
+            _SWEEP_LOCK.release()
+        except Exception:
+            pass
         if resume_tracking is not None:
             try:
                 resume_tracking()
@@ -883,15 +1044,45 @@ class Watcher:
         # capture loop itself runs at camera rate (~30 fps).
         self._last_face_id_at = 0.0
         self._last_track_at = 0.0
-        self.last_faces = []  # [(box, name_or_None, conf)] for tags
+        self.last_faces = []  # [(box, name_or_None, conf)] — identified
+        # faces, internal only (tracking target + status line). Never
+        # drawn on the preview: face tags were cancelled 2026-11-24.
         self._last_track_report = None
         self._last_track_report_at = 0.0
         self._camera_lost_reported = False
+        # --- Automatic minute sweep (2026-11-24 22:12, see
+        # MINUTE_SWEEP_* above) ---
+        self.minute_sweep_enabled = True  # set_minute_sweep() turns it off
+        self._minute_sweep_next = time.time() + MINUTE_SWEEP_INTERVAL_SEC
+        self._minute_sweeping = False
+        self._minute_sweep_thread = None
+        self._alert_describing = False  # True while _alert runs Vision
+        # Visual memory log: one entry per completed minute sweep,
+        # newest last, capped at 200. Each entry: {"time": iso,
+        # "positions": [{label, names, person}], "changes": [...],
+        # "summary": str}. gui "where did I leave X?" answers from
+        # this log plus the note_sighting facts in memory.json.
+        self.visual_log = []
+        self._last_sweep_presence = None  # {label: bool person seen}
 
     def start(self):
         if self.running:
             return "Watcher is already running."
         self.controller.open()
+        # Camera home (2026-11-24, Lorenza — CORRECTED 22:12-22:13):
+        # home is FIXED directly forward, facing the chair in front
+        # of the monitor. Return to it BEFORE the watch loop starts
+        # moving anything — the saved calibration when one exists,
+        # else pan 0 / tilt 0 (directly forward).
+        try:
+            home_pos, home_calibrated = self.controller.go_home()
+            home_text = (f" Camera returned to home, directly forward "
+                         f"facing the chair (pan {home_pos['pan']}°, "
+                         f"tilt {home_pos['tilt']}°, zoom "
+                         f"{home_pos['zoom']}x"
+                         f"{'' if home_calibrated else ', default — no calibration saved yet'}).")
+        except Exception:
+            home_text = ""
         self.running = True
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
@@ -899,7 +1090,7 @@ class Watcher:
         return (f"Watcher started. Armed={self.armed}. Camera index "
                 f"{info.get('index', self.controller.index)} via "
                 f"{info.get('backend')} at {info.get('width')}x"
-                f"{info.get('height')}.")
+                f"{info.get('height')}.{home_text}")
 
     def stop(self):
         self.running = False
@@ -908,19 +1099,22 @@ class Watcher:
 
     # -- Auto-track / face recognition (v1.0.8, items 7 + 9) --------
     def set_auto_track(self, enabled):
-        """Turn auto-tracking on/off. Returns a short status string."""
+        """Turn Harmony tracking on/off. ON resumes Harmony (the
+        PIXY leads, Oracle observes); OFF is a hold-still pause
+        inside Harmony — the camera freezes until tracking is
+        turned back on. Returns a short status string."""
         self.auto_track = bool(enabled)
         if self.tracker is not None:
-            self.tracker.enabled = self.auto_track
             if not self.auto_track:
                 self.tracker.stop()
-                self.tracker.enabled = False
                 self.last_tracked_box = None
                 self.last_track_status = "disabled"
             else:
-                self.tracker.enabled = True
+                self.tracker.resume()
                 self.last_track_status = "idle"
-        return f"Auto-Track: {'ON' if self.auto_track else 'OFF'}."
+        return ("Harmony tracking: ON (PIXY leads, Oracle watches)."
+                if self.auto_track
+                else "Harmony tracking: PAUSED — holding still.")
 
     def track_me(self, name=None):
         """'Track me' / 'track this person' voice command.
@@ -933,16 +1127,237 @@ class Watcher:
         if self.tracker is not None:
             self.tracker.set_target(name)
         if name:
-            return f"Tracking {name} — I'll follow you and keep you centred."
-        return "Tracking you — I'll follow the person in frame and keep them centred."
+            return (f"Tracking {name} in Harmony mode — the PIXY "
+                    f"follows, and I'll quietly keep track of who is "
+                    f"in frame (no boxes or name tags on the picture).")
+        return ("Tracking you in Harmony mode — the PIXY follows the "
+                "person in frame, and I'll quietly keep track of who "
+                "is in frame (no boxes or name tags on the picture).")
 
     def stop_tracking(self):
-        """'Stop tracking' voice command: hold still, stay watching."""
+        """'Stop tracking' / 'hold still' voice command: freeze all
+        movement (a pause inside Harmony), keep watching."""
         if self.tracker is not None:
             self.tracker.stop()
         self.auto_track = False
         self.last_track_status = "disabled"
-        return "Auto-tracking is off. The camera will stay where it is."
+        return ("Tracking paused — the camera will hold still until "
+                "you say track again.")
+
+    # -- Automatic minute sweep (2026-11-24 22:12) ----------------
+    def set_minute_sweep(self, enabled):
+        """Turn the automatic minute sweep on/off. ON is the agreed
+        behaviour (sweep every minute while watching); OFF leaves
+        only the commanded pan-and-describe sweep."""
+        self.minute_sweep_enabled = bool(enabled)
+        if not self.minute_sweep_enabled:
+            self._minute_sweep_next = (
+                time.time() + MINUTE_SWEEP_INTERVAL_SEC)
+        return ("Minute sweep: ON — full left-to-right and back "
+                "every minute while watching."
+                if self.minute_sweep_enabled else
+                "Minute sweep: OFF — only pan-and-describe on request.")
+
+    def _maybe_start_minute_sweep(self):
+        """Called once per captured frame (cheap guard): start the
+        minute sweep when it is due, or defer it. Defer — never
+        yank — when a person is being tracked, while an alert
+        description is running, or while the commanded
+        pan-and-describe holds the sweep lock. The sweep itself
+        runs on its own thread so the capture loop (and the
+        preview) never stalls; while it runs, _loop skips tracker
+        updates so tracking cannot fight it."""
+        if (not self.minute_sweep_enabled or self._minute_sweeping
+                or time.time() < self._minute_sweep_next):
+            return
+        now = time.time()
+        if self.last_tracked_box is not None or self.last_identified_name:
+            # A person is being tracked: defer until tracking
+            # releases — never pull away from them mid-conversation.
+            self._minute_sweep_next = now + MINUTE_SWEEP_DEFER_SEC
+            return
+        if self._alert_describing:
+            self._minute_sweep_next = now + MINUTE_SWEEP_DEFER_SEC
+            return
+        if not _SWEEP_LOCK.acquire(blocking=False):
+            # Commanded pan-and-describe is sweeping: wait for it.
+            self._minute_sweep_next = now + MINUTE_SWEEP_DEFER_SEC
+            return
+        # Lock held until _run_minute_sweep releases it in finally.
+        self._minute_sweeping = True
+        try:
+            thread = threading.Thread(target=self._run_minute_sweep,
+                                      daemon=True)
+            self._minute_sweep_thread = thread
+            thread.start()
+        except Exception:
+            self._minute_sweeping = False
+            self._minute_sweep_thread = None
+            self._minute_sweep_next = now + MINUTE_SWEEP_DEFER_SEC
+            try:
+                _SWEEP_LOCK.release()
+            except Exception:
+                pass
+
+    def _run_minute_sweep(self):
+        """Full sweep left-to-right and back, on the sweep thread.
+        Physical UVC pan when the PIXY obeys it, digital crop pan
+        otherwise (same probe as pan_and_describe). At each stop it
+        samples the loop's 1 Hz face identification — no Vision
+        call, no saved frames — then returns to the FIXED home and
+        resumes tracking. Logs who / whether anyone was seen at
+        each position, and what changed since the last sweep, in
+        visual_log (+ one throttled memory note when something
+        changed or someone was seen). Never raises; the lock is
+        always released and home is always restored."""
+        try:
+            controller = self.controller
+            if controller is None:
+                return
+            start_pan = getattr(controller, "pan", 0)
+            start_zoom = getattr(controller, "zoom", 1.0)
+            start_crop_x = getattr(controller, "crop_x", 0.5)
+            start_crop_y = getattr(controller, "crop_y", 0.5)
+            # Probe: does the motor obey UVC pan? (Same as
+            # pan_and_describe: one move to the far left.)
+            probe = controller.ptz(pan_delta=-PAN_SWEEP_DEG)
+            time.sleep(MINUTE_SWEEP_SETTLE_SEC)
+            physical = bool(probe.get("uvc_pan_ok"))
+            if not physical:
+                # The probe polluted the logical pan — reset it,
+                # then sweep digitally (zoom 1.5x, slide the crop).
+                controller.pan = start_pan
+                try:
+                    controller.ptz(zoom_delta=0.5)
+                except Exception:
+                    pass
+            positions = []
+            for i in range(PAN_SWEEP_STOPS):
+                frac = (i / (PAN_SWEEP_STOPS - 1)
+                        if PAN_SWEEP_STOPS > 1 else 0.5)
+                positions.append(-PAN_SWEEP_DEG
+                                 + 2 * PAN_SWEEP_DEG * frac)
+            order = positions + list(reversed(positions))
+            labels = PAN_POSITION_LABELS
+            seen_positions = []
+            for rel_pan in order:
+                label = labels[positions.index(rel_pan)]
+                try:
+                    if physical:
+                        target = start_pan + rel_pan
+                        controller.ptz(
+                            pan_delta=target - getattr(controller, "pan", 0))
+                    else:
+                        controller.crop_x = (
+                            0.5 + (rel_pan / PAN_SWEEP_DEG) * 0.3
+                            if PAN_SWEEP_DEG else 0.5)
+                except Exception:
+                    pass
+                time.sleep(MINUTE_SWEEP_SETTLE_SEC)
+                # Sample the loop's face ID (best effort: it runs
+                # at most once a second, so a stop may still show
+                # the previous stop's faces — presence per stop is
+                # coarse, never a claim about exact positions).
+                try:
+                    faces = list(getattr(self, "last_faces", []) or [])
+                except Exception:
+                    faces = []
+                names = sorted({n for (_b, n, _c) in faces if n})
+                seen_positions.append({
+                    "label": label,
+                    "names": names,
+                    "person": bool(faces),
+                })
+            # What changed since the last sweep, per position.
+            presence = {}
+            for pos in seen_positions:
+                # A position appears twice (there and back): a
+                # person counts as present if seen on either pass.
+                presence[pos["label"]] = (
+                    presence.get(pos["label"], False) or pos["person"])
+            changes = []
+            prev = self._last_sweep_presence
+            if prev is not None:
+                for label in labels:
+                    now_here = presence.get(label, False)
+                    was_here = prev.get(label, False)
+                    if now_here and not was_here:
+                        changes.append(f"someone appeared at {label}")
+                    elif was_here and not now_here:
+                        changes.append(f"no longer anyone at {label}")
+            self._last_sweep_presence = presence
+            all_names = sorted({n for pos in seen_positions
+                                for n in pos["names"]})
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if all_names:
+                summary = (f"Minute sweep {stamp}: saw "
+                           + ", ".join(all_names))
+            elif any(presence.values()):
+                where = ", ".join(l for l in labels if presence.get(l))
+                summary = (f"Minute sweep {stamp}: someone in frame "
+                           f"at {where} (unknown)")
+            else:
+                summary = f"Minute sweep {stamp}: nobody in frame"
+            if changes:
+                summary += " — changed since last sweep: " + "; ".join(changes)
+            entry = {"time": stamp, "positions": seen_positions,
+                     "changes": changes, "summary": summary}
+            self.visual_log.append(entry)
+            if len(self.visual_log) > 200:
+                del self.visual_log[:-200]
+            # One throttled memory note when something changed or
+            # someone was seen (continuous_memory throttles per key,
+            # so this cannot spam memory.json).
+            if changes or all_names:
+                try:
+                    from continuous_memory import note_sighting as _note
+                    _note(_oracle_app_dir(), summary, key="minute-sweep")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            # Always return to the FIXED home (directly forward,
+            # facing the chair), then resume tracking: the loop
+            # picks tracker updates back up as soon as
+            # _minute_sweeping clears.
+            try:
+                if getattr(self, "controller", None) is not None:
+                    self.controller.go_home()
+            except Exception:
+                pass
+            self._minute_sweeping = False
+            self._minute_sweep_next = (
+                time.time() + MINUTE_SWEEP_INTERVAL_SEC)
+            try:
+                _SWEEP_LOCK.release()
+            except Exception:
+                pass
+
+    def visual_log_text(self, max_entries=10):
+        """Readable text of the recent minute sweeps, newest last —
+        the log 'where did I leave X?' answers from (together with
+        the sighting facts in memory.json)."""
+        entries = list(getattr(self, "visual_log", []) or [])[-max_entries:]
+        if not entries:
+            return "No minute sweeps logged yet."
+        return "\n".join(e.get("summary", "") for e in entries if e.get("summary"))
+
+    def find_in_visual_log(self, thing):
+        """Last minute-sweep summary mentioning ``thing`` (a name or
+        an object word), or None when no sweep ever mentioned it.
+        The sweep log records people/presence per position, not
+        objects — an object is only found here when a pan-and-
+        describe or motion-alert sighting fact named it (see
+        continuous_memory.find_last_seen)."""
+        needle = " ".join(str(thing or "").lower().split())
+        if not needle:
+            return None
+        for entry in reversed(list(getattr(self, "visual_log", []) or [])):
+            summary = str(entry.get("summary", ""))
+            if needle in summary.lower():
+                return summary
+        return None
 
     def enrol_current(self, name):
         """Enrol the face currently in frame under ``name``.
@@ -963,7 +1378,7 @@ class Watcher:
         if self.last_track_status == "camera_lost":
             return "Tracking: camera lost — check the PIXY is plugged in."
         if self.last_track_status in ("disabled",):
-            return "Tracking: off"
+            return "Tracking: paused — hold still"
         if self.last_tracked_box is None:
             if self.last_track_status == "returning":
                 return "Tracking: no person in view — returning to centre."
@@ -1017,6 +1432,10 @@ class Watcher:
             self._camera_lost_reported = False
             self._last_frame = frame
             self._frame_count += 1
+            # Automatic minute sweep: due-check is cheap (a time
+            # comparison) and runs once per frame; the sweep itself
+            # runs on its own thread and pauses tracker updates.
+            self._maybe_start_minute_sweep()
             small = cv2.resize(frame, (640, 360))
             mask = back_sub.apply(small)
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -1039,7 +1458,8 @@ class Watcher:
                             "uvc_ignored": bool(self.tracker.uvc_ignored) if self.tracker else False,
                             "target_name": self.tracker.target_name if self.tracker else None}
             _now = time.time()
-            if self.tracker is not None and self.auto_track:
+            if self.tracker is not None and self.auto_track \
+                    and not self._minute_sweeping:
                 # Face identification is the expensive step: run it
                 # at most once a second (time-based, not per-frame —
                 # every-10th-frame was 3 Hz at 30 fps and stalled
@@ -1052,7 +1472,8 @@ class Watcher:
                     try:
                         # Multi-face: identify EVERY face in frame, not
                         # just the largest — Lorenza + Adonis are in
-                        # frame together and each needs their own tag.
+                        # frame together and each needs their own
+                        # (invisible) identification; nothing is drawn.
                         faces = []
                         for fbox in face_profiles.detect_faces(frame)[:4]:
                             fname, fconf, fbox2 = face_profiles.identify(frame, box=fbox)
@@ -1123,10 +1544,15 @@ class Watcher:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         path = ALERTS_DIR / f"alert-{stamp}.jpg"
         cv2.imwrite(str(path), frame)
+        # The minute sweep must never run during an alert
+        # description: flag it while Vision describes the snapshot.
+        self._alert_describing = True
         try:
             description = describe_snapshot(path)
         except Exception as e:
             description = f"Vision analysis failed: {e}. Motion area was {int(motion_area)}."
+        finally:
+            self._alert_describing = False
         text = (f"Oracle camera alert - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"Motion detected (area {int(motion_area)}).\n"
                 f"What Oracle sees: {description}\n"

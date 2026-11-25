@@ -1,31 +1,50 @@
 """
 Camera auto-tracking for Oracle (Windows) — EMEET PIXY Dual-Camera AI PTZ 4K.
 
-Keeps a person centred in frame, on its own, using OpenCV only
-(no extra dependencies, no cloud). Works in three layers, in order:
+HARMONY MODE ONLY (decided 2026-11-24, Lorenza): the PIXY's own
+native AI tracking leads all physical movement — it is hardware,
+smooth, 310° pan — and Oracle NEVER drives the motor on its own.
+There is no Oracle-only tracking mode and no toggle to switch to
+one: the two trackers fought each other and the camera "freaked
+out", constantly moving with no scan command. Oracle's role is
+observe-only: identify faces (invisibly — no boxes or name tags
+are ever drawn on the preview, 2026-11-24 22:02), watch
+for motion, send alerts, remember who was seen. It intervenes
+with ONE small UVC correction only if the tracked person stays
+clearly off-centre (outside the dead zone) for more than 5 seconds
+with no PIXY correction, then waits at least 5 seconds before
+another. Never during a pan-and-describe sweep, never while the
+camera is already moving. A "hold still" / "stop tracking" command
+is a pause inside Harmony, not a separate mode — it freezes all
+movement until she says track again.
 
-  1. Person detection — HOG people detector + Haar face / full-body
-     cascades (all from OpenCV 4.x). The largest person box wins.
-     Motion (background subtraction) is only a fallback signal when
-     no person detector fires.
-  2. PTZ — frame-centre error -> smoothed, rate-limited PTZ steps
-     through ``CameraController.ptz()`` (UVC first, via DirectShow).
-     A dead zone (|error| < 0.06 of frame width/height) means small
-     movements cause no panning at all — no jitter, no hunting.
-  3. Digital PTZ fallback — when the PIXY ignores UVC PTZ (it
-     often does; EMEET routes motor control through EMEET Studio),
-     the digital crop centre (``crop_x`` / ``crop_y``) is shifted
-     toward the person and the digital zoom is eased up to 1.25x,
-     so framing still follows even though the motor does not move.
-
-Safety rules (from NEXT_BUILD_FEATURES item 7):
-  * At most 1 PTZ step per ~0.5s, steps are small and proportional
-    to the error, and errors are exponentially smoothed — never spin.
-  * No person for >3s: hold the last position, do not hunt.
-  * No person for >15s: gently return to centre (small steps only).
+Calm rules (why the camera stopped hunting):
+  * Bigger dead zone (0.10 of frame): small movements move nothing.
+  * Target lock: once locked onto a person, Oracle does not switch
+    to another person / motion blob unless that person leaves frame
+    for more than 10 seconds.
+  * Sticky box: a detection whose centre jumps >0.25 of the frame
+    from the last box within a second is ignored — that is a
+    detector flip or a TV flicker, not a person teleporting.
+  * Motion fallback is person-shaped only (taller than wide) and
+    must cover >=5% of the frame — a TV screen flickering is wide,
+    not a person, and no longer steers the camera.
+  * Face boxes are expanded symmetrically around the face centre
+    (the old 3x-wide / 4x-tall expansion biased the centre
+    downwards and let faces win over full-body boxes, so the
+    target jumped between detectors every run).
+  * No return-to-centre hunting: when nobody is in view, Harmony
+    holds still — the PIXY owns the position.
+  * At most 1 correction per 5s, steps are small (<=8°), errors are
+    exponentially smoothed — never spin.
   * Frame read fails: do not move, do not crash — report
     ``camera_lost`` and hold still until frames come back.
   * Tracking data stays local on the PC.
+
+Detection layers, in order: HOG people + Haar face / full-body
+cascades (OpenCV 4.x). The largest person box wins, subject to the
+sticky-box and target-lock rules above. Motion (background
+subtraction) is only a fallback when no person detector fires.
 
 Version note: opencv-python 5.x removed ``HOGDescriptor`` and
 ``CascadeClassifier``. This module needs the 4.x line —
@@ -37,16 +56,22 @@ remaining detectors + motion carry on.
 
 import time
 
-DEAD_ZONE = 0.06          # fraction of frame w/h: inside this, no move
+DEAD_ZONE = 0.10          # fraction of frame w/h: inside this, no move
 SMOOTHING = 0.35          # exponential smoothing alpha for centre error
-MIN_STEP_INTERVAL = 0.5   # seconds between PTZ steps (at most 1 per 0.5s)
-MAX_PAN_STEP = 20         # degrees per step
-MAX_TILT_STEP = 15        # degrees per step
+MIN_STEP_INTERVAL = 0.75  # seconds between PTZ steps (at most 1 per 0.75s)
+MAX_PAN_STEP = 12         # degrees per step (Harmony intervention cap)
+MAX_TILT_STEP = 10        # degrees per step
 MIN_STEP = 4              # degrees: smallest step worth sending
 HOLD_AFTER_NO_PERSON = 3.0    # seconds with no person: hold, do not hunt
-RETURN_AFTER_NO_PERSON = 15.0  # seconds with no person: gently return to centre
+# Harmony: the PIXY leads; Oracle only nudges when the PIXY has
+# clearly not corrected an off-centre person for this long.
+HARMONY_OFF_CENTRE_SECONDS = 5.0
+HARMONY_CORRECTION_COOLDOWN = 5.0
+HARMONY_MAX_STEP = 8     # degrees: one small correction, never a swing
+TARGET_LOCK_SECONDS = 10.0  # keep a locked target this long after it vanishes
+STICKY_JUMP = 0.25       # frame fraction: a bigger centre jump is a flip, not a move
 DETECT_EVERY = 0.3        # seconds between person-detection runs
-MOTION_MIN_FRACTION = 0.02  # motion box must cover >=2% of the frame
+MOTION_MIN_FRACTION = 0.05  # motion box must cover >=5% of the frame
 DIGITAL_ZOOM_WHEN_TRACKING = 1.25  # zoom used when UVC PTZ is ignored
 
 
@@ -65,6 +90,11 @@ class AutoTracker:
         self.smoothing = smoothing
         self.min_step_interval = min_step_interval
         self.enabled = True
+        # Harmony only (2026-11-24 decision): "harmony" is the one
+        # tracking mode — the PIXY leads, Oracle observes. "off" is
+        # the hold-still pause inside Harmony, not a separate mode.
+        # There is deliberately no Oracle-only driving mode.
+        self.mode = "harmony"
         self.target_name = None  # "track this person": prefer this identity
         self.last_box = None     # (x, y, w, h) in full-frame pixels
         self.last_source = None  # 'hog' | 'face' | 'fullbody' | 'motion' | None
@@ -74,6 +104,12 @@ class AutoTracker:
         self.returning_to_centre = False
         self.uvc_ignored = False  # True once UVC PTZ has reported all-False
         self.detector_status = {}  # {'hog': True, 'face': True, ...}
+        # Harmony state: when the tracked person first went
+        # off-centre, and when Oracle last sent a correction.
+        self._off_centre_since = None
+        self._last_harmony_correction = 0.0
+        self._target_last_seen = 0.0
+        self._last_digital_follow = 0.0
         self._smooth_ex = 0.0
         self._smooth_ey = 0.0
         self._last_step = 0.0
@@ -177,10 +213,15 @@ class AutoTracker:
                     gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
                 for (x, y, bw, bh) in faces:
                     # A face box alone is small; expand it to an
-                    # approximate upper-body box so framing uses the
-                    # person, not just their head.
-                    _add((max(0, x - bw), max(0, y - bh // 2),
-                          bw * 3, bh * 4), "face")
+                    # approximate upper-body box, SYMMETRICALLY around
+                    # the face centre, so framing uses the person, not
+                    # just their head — and so the box centre stays on
+                    # the person instead of drifting below the face
+                    # (the old 3x-wide / 4x-tall expansion biased the
+                    # centre down and let faces beat full-body boxes,
+                    # flipping the target between detectors).
+                    _add((max(0, x - bw // 2), max(0, y - bh),
+                          bw * 2, bh * 3), "face")
             except Exception:
                 pass
         if self._body_cascade is not None:
@@ -196,11 +237,14 @@ class AutoTracker:
             self._last_detect_box = box
             self.last_source = source
             return box
-        # Fallback: motion only, and only if it is big enough to be a
-        # person rather than a curtain / pet / noise.
+        # Fallback: motion only, and only if it is big enough AND
+        # person-shaped (taller than wide) to be a person rather
+        # than a curtain / pet / TV flicker. A TV screen flickering
+        # is a wide blob — it must never steer the camera.
         if motion_box is not None:
             mx, my, mw, mh = motion_box
-            if mw * mh >= MOTION_MIN_FRACTION * w * h:
+            if (mw * mh >= MOTION_MIN_FRACTION * w * h
+                    and mh > mw):
                 self._last_detect_box = motion_box
                 self.last_source = "motion"
                 return motion_box
@@ -314,25 +358,38 @@ class AutoTracker:
     def update(self, frame, motion_box=None, identified_faces=None):
         """Process one frame. Returns a status dict (never raises).
 
+        Harmony only: the PIXY's native AI tracking moves the
+        camera; Oracle observes (detection + face ID, invisible —
+        no boxes or name tags are drawn) and sends at most ONE small UVC correction when the
+        tracked person has stayed clearly off-centre for more than
+        HARMONY_OFF_CENTRE_SECONDS with no PIXY correction, then
+        waits HARMONY_CORRECTION_COOLDOWN before another. Digital
+        framing is throttled the same way. No hunting, no
+        return-to-centre: when nobody is in view, hold still.
+
         identified_faces: optional [(box, name_or_None, confidence)]
         from face recognition — when ``target_name`` is set, the
-        target's face box is preferred over the largest person box.
+        target's face box is preferred over the largest person box,
+        and the lock holds for TARGET_LOCK_SECONDS after the target
+        leaves frame before any switch is allowed.
         Status keys: box, source, error_x, error_y, moved,
-        action ('tracking'|'holding'|'returning'|'idle'|'disabled'|
-        'camera_lost'), camera_lost, uvc_ignored, target_name.
+        action ('harmony'|'harmony-correcting'|'holding'|'disabled'|
+        'camera_lost'), camera_lost, uvc_ignored, target_name, mode.
         """
         status = {"box": self.last_box, "source": self.last_source,
                   "error_x": 0.0, "error_y": 0.0, "moved": False,
                   "action": "idle", "camera_lost": False,
                   "uvc_ignored": self.uvc_ignored,
-                  "target_name": self.target_name}
-        if not self.enabled:
+                  "target_name": self.target_name,
+                  "mode": self.mode}
+        if not self.enabled or self.mode == "off":
             status["action"] = "disabled"
             return status
         if frame is None:
             # Camera lost: do not move, do not crash, say so.
             self.camera_lost = True
             self.last_box = None
+            self._off_centre_since = None
             status.update({"box": None, "action": "camera_lost",
                            "camera_lost": True})
             return status
@@ -344,15 +401,36 @@ class AutoTracker:
                 if fname == self.target_name:
                     box = fbox
                     self.last_source = "face-target"
+                    self._target_last_seen = now
                     break
+        if box is None and self.target_name and self.last_seen_box is not None:
+            # Target lock: the named person vanished from face ID —
+            # hold their last box for up to TARGET_LOCK_SECONDS
+            # instead of jumping to another person / motion blob.
+            if now - self._target_last_seen < TARGET_LOCK_SECONDS:
+                box = self.last_seen_box
+                self.last_source = "face-target-held"
         if box is None:
             box = self.detect_person(frame, motion_box=motion_box)
         if box is not None:
+            fh, fw = frame.shape[:2]
+            # Sticky box: a centre jump of more than STICKY_JUMP of
+            # the frame within a second is a detector flip (or a TV
+            # flicker), not a person teleporting — keep the last box.
+            if (self.last_seen_box is not None
+                    and now - self.last_seen < 1.0):
+                lx = self.last_seen_box[0] + self.last_seen_box[2] / 2.0
+                ly = self.last_seen_box[1] + self.last_seen_box[3] / 2.0
+                cx0 = box[0] + box[2] / 2.0
+                cy0 = box[1] + box[3] / 2.0
+                if (abs(cx0 - lx) / fw > STICKY_JUMP
+                        or abs(cy0 - ly) / fh > STICKY_JUMP):
+                    box = self.last_seen_box
+                    self.last_source = "held"
             self.last_box = box
             self.last_seen = now
             self.last_seen_box = box
             self.returning_to_centre = False
-            fh, fw = frame.shape[:2]
             cx = box[0] + box[2] / 2.0
             cy = box[1] + box[3] / 2.0
             error_x = (cx - fw / 2.0) / fw
@@ -366,41 +444,51 @@ class AutoTracker:
             status.update({"box": box, "source": self.last_source,
                            "error_x": round(error_x, 3),
                            "error_y": round(error_y, 3),
-                           "action": "tracking"})
+                           "action": "harmony"})
+            off_centre = (abs(self._smooth_ex) >= self.dead_zone
+                          or abs(self._smooth_ey) >= self.dead_zone)
+            if not off_centre:
+                # Person is centred (or close): the PIXY has it.
+                # Reset the off-centre clock — no correction needed.
+                self._off_centre_since = None
+                return status
+            if self._off_centre_since is None:
+                self._off_centre_since = now
+            if now - self._off_centre_since < HARMONY_OFF_CENTRE_SECONDS:
+                # Not yet 5s off-centre: the PIXY may still correct
+                # on its own. Wait — do not chase it.
+                return status
+            if now - self._last_harmony_correction < HARMONY_CORRECTION_COOLDOWN:
+                return status
             if now - self._last_step < self.min_step_interval:
-                return status  # rate limit: at most 1 PTZ step per 0.5s
-            pan_step = self._step_for_error(self._smooth_ex, MAX_PAN_STEP)
-            tilt_step = -self._step_for_error(self._smooth_ey, MAX_TILT_STEP)
+                return status
+            # The PIXY has not corrected for 5+ seconds: ONE small
+            # UVC nudge (<=8°), then at least 5s before another.
+            pan_step = self._step_for_error(self._smooth_ex, HARMONY_MAX_STEP)
+            tilt_step = -self._step_for_error(self._smooth_ey, HARMONY_MAX_STEP)
             # Tilt sign: person below centre (error_y > 0) needs a
             # downward tilt, and camera.py treats positive tilt as up.
             if pan_step or tilt_step:
                 self._drive(pan_step, tilt_step)
                 self._last_step = now
+                self._last_harmony_correction = now
+                self._off_centre_since = None
                 status["moved"] = True
-            # Digital framing follows even when the motor does not.
-            self._digital_follow(self._smooth_ex, self._smooth_ey)
+                status["action"] = "harmony-correcting"
+            # Digital framing follows, throttled, only while
+            # off-centre — never a continuous crop drift.
+            if now - self._last_digital_follow >= 1.0:
+                self._digital_follow(self._smooth_ex, self._smooth_ey)
+                self._last_digital_follow = now
             return status
-        # No person in this frame.
+        # No person in this frame: hold still. Harmony never hunts
+        # and never drifts back to centre — the PIXY owns position.
         self.last_box = None
+        self.last_source = None
+        self._off_centre_since = None
         status["box"] = None
-        idle_for = now - self.last_seen if self.last_seen else float("inf")
-        if self.last_seen == 0.0 or idle_for <= HOLD_AFTER_NO_PERSON:
-            status["action"] = "holding"  # hold last position, do not hunt
-            return status
-        if idle_for <= RETURN_AFTER_NO_PERSON:
-            status["action"] = "holding"
-            return status
-        # Nobody for >15s: gently drift back to centre, one small
-        # step per rate-limit interval — never a fast spin home.
-        if now - self._last_step < self.min_step_interval:
-            status["action"] = "returning"
-            return status
-        self.returning_to_centre = True
-        moved = self._return_to_centre_step()
-        self._smooth_ex = 0.0
-        self._smooth_ey = 0.0
-        self._last_step = now
-        status.update({"action": "returning", "moved": moved})
+        status["source"] = None
+        status["action"] = "holding"
         return status
 
     # Backwards-friendly alias: process(frame) == update(frame).
@@ -411,13 +499,50 @@ class AutoTracker:
     def set_target(self, name=None):
         """'Track me' / 'track this person': prefer this identity's
         face when face recognition knows them; None = largest person.
-        """
+        The lock holds for TARGET_LOCK_SECONDS after the target
+        leaves frame before any switch is allowed."""
         self.target_name = (str(name).strip() if name else "") or None
+        if self.target_name:
+            self._target_last_seen = time.time()
+
+    def set_mode(self, mode):
+        """Harmony only. ``mode`` is 'harmony' (PIXY leads, Oracle
+        observes) or 'off' (hold still — a pause inside Harmony).
+        Anything else raises ValueError: there is deliberately no
+        Oracle-only driving mode, so the two trackers can never
+        fight again (decided 2026-11-24)."""
+        mode = str(mode or "").strip().lower()
+        if mode not in ("harmony", "off"):
+            raise ValueError(
+                "Tracking is Harmony only — 'harmony' or 'off'. "
+                "There is no Oracle-only driving mode.")
+        self.mode = mode
+        if mode == "off":
+            self.enabled = False
+            self.target_name = None
+            self._smooth_ex = 0.0
+            self._smooth_ey = 0.0
+            self._off_centre_since = None
+            self.returning_to_centre = False
+        else:
+            self.enabled = True
 
     def stop(self):
-        """Stop tracking safely: no more moves, errors reset."""
+        """Hold still: no more moves, errors reset. A pause inside
+        Harmony — resume() brings Harmony back, it does not change
+        the mode."""
         self.enabled = False
+        self.mode = "off"
         self.target_name = None
         self._smooth_ex = 0.0
         self._smooth_ey = 0.0
+        self._off_centre_since = None
         self.returning_to_centre = False
+
+    def resume(self):
+        """End a hold-still pause: back to Harmony (PIXY leads,
+        Oracle observes)."""
+        self.mode = "harmony"
+        self.enabled = True
+        self._off_centre_since = None
+        self._last_harmony_correction = 0.0

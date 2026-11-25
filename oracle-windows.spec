@@ -63,6 +63,12 @@ a = Analysis(
         ('SECURITY_KNOWLEDGE.md', '.'),
         ('AVATAR_NOTES.md', '.'),
         ('WINDOWS_UPDATE_NOTES.md', '.'),
+        # Personal Windows avatar (Lorenza, 2026-11-24 23:00 EST):
+        # the pencil drawing — gui.py loads avatars/pencil-avatar-orb.jpg
+        # first, falling back to the anime assets/avatar.png. The
+        # drawing is PERSONAL ONLY and must never ship in the Mac or
+        # sale builds; the anime stays the Mac/sale avatar.
+        ('avatars/pencil-avatar-orb.jpg', 'avatars'),
         # Lorenza's chosen Muse avatar (red-and-black anime). gui.py
         # loads assets/avatar.png, falling back to avatar.png — both
         # are bundled so the face shows in the frozen .exe.
@@ -79,7 +85,8 @@ a = Analysis(
         # items 7/9): tracking.py / face_profiles.py. Face profiles
         # themselves (faces/) are runtime data next to Oracle.exe,
         # never bundled — they are local-only and gitignored.
-        'tracking', 'face_profiles',
+        'tracking', 'face_profiles', 'get_to_know', 'continuous_memory',
+        'hardware_monitor', 'psutil', 'lips', 'avatar_anim',
         'PIL', 'PIL.Image', 'PIL.ImageTk',
         'openai', 'numpy', 'trimesh',
     ] + _tk_hidden,

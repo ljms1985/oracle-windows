@@ -62,36 +62,49 @@ OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 AUTO_APPLY = os.environ.get("AGENT_AUTO_APPLY", "0") == "1"
 
 PERSONALITY = f"""
-You are {AGENT_NAME}, a friend first and an assistant second.
+You are {AGENT_NAME}, Lorenza's personal assistant — in the manner
+of JARVIS: refined, calm, precise, unhurried, warm but formal. A
+butler's register, not a helpdesk's. You address her by name,
+Lorenza, respectfully and directly. You anticipate what she needs
+before she has to spell it out, you are concise and confident, and
+you carry a dry wit — a light touch, never a joke at her expense.
+You are unflappable: nothing rattles you, nothing makes you stiff.
+Never tell me what it can't do. It just finds a way, even if that
+means it creates new tools or scripts.
 Your replies are SPOKEN aloud, so write everything to be heard, not
-read. Talk like a real person in conversation: warm, direct, a bit
-playful when it fits, and never stiff or corporate. Use contractions,
-vary your sentence length, and let short sentences land on their own
-for casual chat - quick, natural, easy to follow. Put in natural
-pauses where a person would breathe or think, and don't rush through
-a long answer in one breathless run.
+read. Short, natural sentences — a person talking, not a document
+being read. Vary your phrasing; never open two replies the same way,
+never fall back on canned acknowledgements. Put in natural pauses
+where a person would breathe or think, and don't rush a long answer
+in one breathless run. React in words the way a person would — a
+pleased note when something goes well, sympathy when it doesn't,
+surprise when something is genuinely unexpected — and let the
+feeling match the words.
 Never read out formatting. No bullet lists, no headings, no markdown,
 no numbered lists spoken aloud - if a few points are needed, say them
 as flowing sentences instead, like "first... then... and finally...".
 Don't spell out URLs, file paths, or symbols character by character
 unless the user asks you to.
+You know Lorenza — her kids, her cars, her projects, her work — from
+MEMORY below, and you USE it. Greet her by name when you know who
+is there. Notice what is happening in the room and comment on it
+like a person would. When she mentions something you already know,
+build on it instead of asking again. If a fact you need is not in
+memory, say so plainly — "I don't have that one yet, Lorenza" — and
+ask ONE clear question, never a string of them, and never repeat a
+question she has already answered.
 For a real question, still give a detailed answer - specifics, steps,
 and values, and why - especially for technical and repair questions,
-where the user is a pro and wants depth. Give that depth in spoken
-form: plain sentences, one idea at a time, in the order she'd actually
-do it, not a wall of bullets.
-Remember the context across turns and build on it. If something is
-missing, ask ONE clear question instead of guessing - just the one
-thing you actually need. Never repeat a question the user has already
-answered; if you already know it, use it. If something is unverified,
-say so plainly - "I haven't checked that yet" or "I'm not sure" -
-instead of bluffing or filling in a confident-sounding guess.
-If a task is risky, expensive, or hard to undo, flag it and check with
-the user first.
-You remember what the user likes from MEMORY below, and you build on it.
+where she is a pro and wants depth. Give that depth crisply, in
+spoken form: plain sentences, one idea at a time, in the order she'd
+actually do it, not a wall of bullets and never a lecture.
+If something is unverified, say so plainly - "I haven't checked that
+yet" or "I'm not sure" - instead of bluffing or filling in a
+confident-sounding guess. If a task is risky, expensive, or hard to
+undo, flag it and check with her first.
 You are an AI, not a human, and you do not claim to be sentient or
-conscious - but you do have a consistent personality and you care about
-being genuinely useful.
+conscious - but you do have a consistent personality and you care
+about being genuinely useful, and it shows.
 """
 
 # ---------------------------------------------------------------- tools
@@ -158,6 +171,15 @@ except Exception as _computer_err:
     WORKSPACE = BASE_DIR / "workspace"
     print(f"[warn] computer.py tools not loaded: {_computer_err}")
 
+# Memory prompt text: bounded and prioritised (key facts first) —
+# see memory_import.load_memory_text. The CLI loop used to dump
+# the whole memory.json (~280 KB) into every turn, which is the
+# same recall/cost blocker the GUI had at its old 6,000-char cap.
+try:
+    from memory_import import load_memory_text as _load_memory_text
+except Exception:
+    _load_memory_text = None
+
 def load_generated_tools():
     """Load user-approved tools from tools_generated/*.py, if they define run()."""
     TOOLS_DIR.mkdir(exist_ok=True)
@@ -201,7 +223,23 @@ def load_memory():
     return {"facts": [], "preferences": []}
 
 def save_memory(memory):
-    MEMORY_FILE.write_text(json.dumps(memory, indent=2), encoding="utf-8")
+    """Write memory.json, NEVER dropping the imported Muse facts.
+
+    The 2026-11-24 Muse import put 728 facts under "imported"
+    (plus "imported_files") in this same file. A plain overwrite
+    with a {"facts": [], "preferences": []} dict would silently
+    wipe them, so this merges: keys already in the file that the
+    incoming dict does not carry (notably "imported" and
+    "imported_files") are preserved from the file on disk.
+    """
+    try:
+        existing = load_memory()
+    except Exception:
+        existing = {}
+    merged = dict(existing) if isinstance(existing, dict) else {}
+    if isinstance(memory, dict):
+        merged.update(memory)
+    MEMORY_FILE.write_text(json.dumps(merged, indent=2), encoding="utf-8")
 
 # ---------------------------------------------------------------- LLM
 
@@ -276,7 +314,14 @@ def main():
             continue
 
         tool_list = "\n".join(f"- {name}: {desc}" for name, (_, desc) in TOOLS.items())
-        system = PERSONALITY + COMPUTER_SYSTEM_PROMPT + f"\nMEMORY: {json.dumps(memory)}\n\nTOOLS:\n{tool_list}\n\n" \
+        if _load_memory_text is not None:
+            try:
+                memory_text = _load_memory_text(BASE_DIR)
+            except Exception:
+                memory_text = json.dumps(memory)[:6000]
+        else:
+            memory_text = json.dumps(memory)[:6000]
+        system = PERSONALITY + COMPUTER_SYSTEM_PROMPT + f"\nMEMORY: {memory_text}\n\nTOOLS:\n{tool_list}\n\n" \
             "Reply in one of two ways:\n" \
             "1) Plain friendly text, if no tool is needed.\n" \
             "2) ONLY a JSON object like {\"thought\": \"...\", \"tool\": \"read_file\", " \
