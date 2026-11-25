@@ -68,46 +68,56 @@ MAX_MOTION_ALERTS = 2
 # Key-fact ("anchor") matchers. Word-boundary regexes, so "son"
 # does not match "person"/"Session" and "Asia" does not match
 # "fantasia". An anchor is an entry that states a family role, a
-# wife fact, a car fault, or the 6-kid household — the facts the
+# wife fact, a car fault, or the household — the facts the
 # 2026-11-24 recall test proved get lost (kids, Challenger,
-# Sonata/P1326). "Anissa" is the misspelling the assistant used
-# for Anisa in replies; it is matched so the correction entry is
-# anchored too, but the test asserts the correct "Anisa" spelling.
-_KID_RE = re.compile(r"\b(aiden|anisa|anissa|ariya|asia|adonis|de'aris|dearis)\b", re.IGNORECASE)
+# Sonata/P1326).
+# CORRECTION 2026-11-25 (Lorenza's own words): Anisa is Candice's
+# daughter, a ninth-grader — NOT one of Lorenza's children. Anisa
+# is therefore deliberately NOT in _KID_RE: an entry that merely
+# mentions Anisa must never anchor as a Lorenza-kid fact, and must
+# never feed the family roster. The Anisa correction itself is
+# anchored separately, by _ANISA_CORRECTION_RE below.
+_KID_RE = re.compile(r"\b(aiden|ariya|asia|adonis|de'aris|dearis|maliyah|avery)\b", re.IGNORECASE)
+_ANISA_RE = re.compile(r"\b(anisa|anissa)\b", re.IGNORECASE)
+_CANDICE_RE = re.compile(r"\bcandice\b", re.IGNORECASE)
 _ROLE_RE = re.compile(r"\b(daughter|son|child|children|kids|middle|youngest|two-year-old|ninth-grader)\b", re.IGNORECASE)
 _WIFE_RE = re.compile(r"\bwife\b", re.IGNORECASE)
 _ASHLEY_RE = re.compile(r"\bashley\b", re.IGNORECASE)
 _CAR_RE = re.compile(r"\b(challenger|sonata|p1326)\b|knock sensor|active exhaust|turn signal", re.IGNORECASE)
 _HOUSEHOLD_RE = re.compile(r"\b6 kids\b", re.IGNORECASE)
-# The six names the 2026-11-24 step-2 recall test must be able to
-# list. The imported memory never states in Lorenza's own words
-# that Anisa or De'Aris are her children — it deliberately leaves
-# their relationship unnamed — so a model that only repeats
-# stated relationships lists four kids and then says it knows
-# there are six. The household IS six kids (her own vacation
-# party-of-8 fact and the "6 kids" household lines), and these
-# six names are the ones that appear among the family's anchor
-# entries, so when all six are present alongside a "6 kids"
-# household line the prompt states the roster outright in one
-# line. The line is derived from the memory at load time, never
-# written into memory.json, and it disappears if the memory
-# ever stops supporting it.
-_SIX_KIDS = ("Aiden", "Anisa", "Ariya", "Asia", "Adonis", "De'Aris")
+# Lorenza's named children, corrected 2026-11-25 (her own words):
+# Aiden, Ariya, Asia, Adonis, De'Aris, Maliyah (daughter, named
+# 2026-11-25: "I have a daughter named Maliyah"), and Avery (son,
+# named 2026-11-25: "As well as a son named Avery"). That is SEVEN
+# named children — it conflicts with the earlier 2026-11-04
+# party-of-8 figure (herself + wife + 6 kids), and the total is
+# NOT yet confirmed, so NO named child is ever dropped to force
+# the count to six, and the roster line says so plainly. Anisa is
+# NOT in this list: she is Candice's daughter.
+_NAMED_KIDS = ("Aiden", "Ariya", "Asia", "Adonis", "De'Aris", "Maliyah", "Avery")
 
 
 def _family_roster_line(entries):
     """One-line family roster, or None when the memory does not
-    support it: all six kid names must appear in anchor (key)
-    entries and a '6 kids' household line must be present."""
+    support it: all seven named children must appear in anchor
+    (key) entries. The old '6 kids' household line is deliberately
+    NOT required — seven named children conflicts with that
+    earlier figure, and the total is unconfirmed, so the roster
+    states the seven names and flags the conflict instead of
+    dropping a child to fit the old count. Anisa is never in the
+    roster: the line states outright that she is Candice's
+    daughter, not one of Lorenza's children."""
     key_text = " ".join(x for t, x, d, _o in entries
                         if _anchor_kind(t, x) is not None)
     if not all(re.search(r"\b" + re.escape(name) + r"\b", key_text,
-                         re.IGNORECASE) for name in _SIX_KIDS):
+                         re.IGNORECASE) for name in _NAMED_KIDS):
         return None
-    if not any(_HOUSEHOLD_RE.search(x) for _t, x, _d, _o in entries):
-        return None
-    return ("Lorenza's six children are Aiden, Anisa, Ariya, Asia, "
-            "Adonis, and De'Aris.")
+    return ("Lorenza's seven named children are Aiden, Ariya, Asia, "
+            "Adonis, De'Aris, Maliyah, and Avery. (Note: seven named "
+            "children conflicts with an earlier party-of-8 figure "
+            "that said 6 kids — the total is not yet confirmed, so "
+            "do not drop any named child.) Anisa is NOT one of her "
+            "children: Anisa is Candice's daughter, a ninth-grader.")
 _QUERY_STOPWORDS = frozenset(
     "what is the are was were do does did can could would should how why when where who whom whose which that this these those and or but not for with about into your you my her his its their our the a an of to in on at by".split()
 )
@@ -431,11 +441,14 @@ def _is_motion_alert(text):
 
 def _anchor_kind(topic, text):
     """Key-fact kind for one entry, or None. Kind order is the
-    fill order inside the key-facts budget: index lines name each
-    person outright, kid-role/wife lines state the relationship,
-    car lines state the faults, household lines restate the 6-kid
-    party (useful context, first to be cut if the budget runs
-    out)."""
+    fill order inside the key-facts budget: the Anisa correction
+    first (it overrides the old wrong roster), then index lines
+    name each person outright, kid-role/wife lines state the
+    relationship, car lines state the faults, household lines
+    restate the 6-kid party (useful context, first to be cut if
+    the budget runs out)."""
+    if _ANISA_RE.search(text) and _CANDICE_RE.search(text):
+        return "correction"
     if topic in ("Members", "People Index") and (
             _KID_RE.search(text) or _ASHLEY_RE.search(text)):
         return "index"
@@ -472,8 +485,9 @@ def _matches_query(text, words):
 def _ordered_entries(base_dir, query=None):
     """Memory entries in prompt order: [(topic, text, date, is_key)].
 
-    1. Key facts first — identity/family + cars, kind order
-       (index, kid-role, wife, car, household), capped at
+    1. Key facts first — the Anisa correction, identity/family +
+       cars, kind order (correction, index, kid-role, wife, car,
+       household), capped at
        KEY_FACTS_CHARS. These are never crowded out: on the real
        2026-11-25 memory the canonical kinds measure ~7,000
        chars, so they always fit, and only household restatements
@@ -490,8 +504,8 @@ def _ordered_entries(base_dir, query=None):
     entries = _all_entries(base_dir)
     words = _query_words(query)
     anchors = {}  # id(entry) -> kind rank
-    kind_rank = {"index": 0, "kid-role": 1, "wife": 2, "car": 3,
-                 "household": 4}
+    kind_rank = {"correction": 0, "index": 1, "kid-role": 2, "wife": 3, "car": 4,
+                 "household": 5}
     for entry in entries:
         kind = _anchor_kind(entry[0], entry[1])
         if kind is not None:

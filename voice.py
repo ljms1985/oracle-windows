@@ -259,6 +259,63 @@ def stop_speaking():
                 _tts_engine.stop()
     except Exception:
         pass
+    _set_level(0.0)
+
+
+# ---------------------------------------------------------------- interrupt phrases
+
+_INTERRUPT_PHRASES = ("stop", "shut up", "be quiet", "that's enough",
+                      "that is enough", "that’s enough", "quiet",
+                      "stop talking", "stop it", "enough", "hush")
+
+
+def is_interrupt_phrase(text):
+    """True if ``text`` is a short interrupt command — "stop",
+    "shut up", "be quiet", "that's enough" — and NOT a longer
+    sentence that merely contains the word (e.g. "stop by the
+    store" or "stop the car" must never stop the agent). Matches:
+    the text IS one of the phrases, or it is at most 3 words and
+    starts with a multi-word phrase ("be quiet please") or ends
+    with one ("Oracle, stop"). A lone "stop" only counts on its
+    own or as a trailing word ("Oracle, stop"). Used by the GUI's
+    listen loop and by typed input."""
+    if not text:
+        return False
+    low = re.sub(r"[^a-z0-9' ]+", " ",
+                 str(text).lower()).strip()
+    low = re.sub(r"\s+", " ", low)
+    words = low.split()
+    if not words or len(words) > 3:
+        return False
+    if low in _INTERRUPT_PHRASES:
+        return True
+    multi = ("shut up", "be quiet", "that's enough", "that is enough",
+             "that’s enough", "stop talking", "stop it")
+    if any(low.startswith(p) or low.endswith(p) for p in multi):
+        return True
+    # Trailing bare "stop": "Oracle, stop" — but not "stop the car".
+    if len(words) <= 2 and low.endswith(" stop"):
+        return True
+    return False
+
+
+def contains_interrupt_command(text):
+    """True if ``text`` carries an interrupt command anywhere in it.
+    For the while-speaking listener: the mic hears the agent's own
+    voice too, so a transcription there is usually a long sentence,
+    not a clean two-word command — is_interrupt_phrase() alone
+    would miss "…shut up, be quiet" buried in it. The multi-word
+    commands "shut up" / "be quiet" / "that's enough" are
+    distinctive enough (the agent essentially never says them) to
+    match as substrings; bare "stop" is not, so it still needs the
+    short-command match above."""
+    if not text:
+        return False
+    if is_interrupt_phrase(text):
+        return True
+    low = str(text).lower()
+    return ("shut up" in low or "be quiet" in low
+            or "that's enough" in low or "that is enough" in low)
 
 
 def _new_stop_event():

@@ -146,6 +146,13 @@ def main():
     open_f, open_ms, _ = timed(
         lambda: ad.deform_avatar(base, mouth_open=1.0, mouth_shape="open",
                                  profile="pencil"))
+    # Speaking-closed: low level while speaking compresses the drawn
+    # grin into a thin smile (mouth_closed=1, the fix for the live
+    # "mouth stays closed" report — the stretch-only warp moved
+    # pixels but showed no open/close cycle).
+    closed_sp, _, _ = timed(
+        lambda: ad.deform_avatar(base, mouth_open=0.0, mouth_shape="closed",
+                                 mouth_closed=1.0, profile="pencil"))
     blink, blink_ms, _ = timed(
         lambda: ad.deform_avatar(base, blink=1.0, profile="pencil"))
     look_l, _, _ = timed(
@@ -175,6 +182,21 @@ def main():
     check("mouth open viseme moves the mouth",
           m_mean >= 10.0 and m_frac >= 0.15,
           f"mouth mean={m_mean:.2f} frac>20={m_frac:.3f} (thresholds 10 / 0.15)")
+
+    # --- 3b. speaking-closed compresses the grin (and only it) -------
+    # The closed frame must move the mouth as much as the wide frame
+    # does, touch nothing else, AND differ from the wide frame by at
+    # least as much — otherwise there is still no visible open/close
+    # cycle, only two flavours of the same grin (the live failure).
+    c_mean, _, c_frac, _ = region_stats(base, closed_sp, mouth_box)
+    ce_mean, _, _, _ = region_stats(base, closed_sp, eye_box)
+    cw_mean, _, cw_frac, _ = region_stats(closed_sp, wide, mouth_box)
+    check("speaking-closed compresses the grin (distinct from wide)",
+          c_mean >= 15.0 and c_frac >= 0.25 and ce_mean <= 1.0
+          and cw_mean >= 15.0 and cw_frac >= 0.25,
+          f"closed-vs-base mouth mean={c_mean:.2f} frac>20={c_frac:.3f}; "
+          f"eyes mean={ce_mean:.2f}; closed-vs-wide mouth mean={cw_mean:.2f} "
+          f"frac>20={cw_frac:.3f} (thresholds 15 / 0.25 / 1 / 15 / 0.25)")
 
     # --- 4. blink: both eyes close, mouth untouched ------------------
     e_mean, e_max, e_frac, _ = region_stats(base, blink, eye_box)
@@ -240,16 +262,19 @@ def main():
     # reaches y~176). Anything changed outside those cells would be
     # a drawn-on shape or a whole-image shift, not a warp.
     alpha_ok = all(whole_alpha_diff(base, f) == 0.0
-                   for f in (wide, blink, look_l, look_r, smile))
+                   for f in (wide, closed_sp, blink, look_l, look_r, smile))
 
     def displaced_cells(params):
         cells = set()
         xc, yc = geom.x_cuts, geom.y_cuts
         corner_disp = {}
+        mk, wa = ad._mouth_params(
+            geom, params.get("mouth_open", 0.0),
+            params.get("mouth_shape", "closed"),
+            params.get("mouth_closed", 0.0))
         for x in xc:
             for y in yc:
-                dx, dy = ad._displacement(x, y, params.get("mouth_open", 0.0),
-                                          params.get("wide", 0.0),
+                dx, dy = ad._displacement(x, y, mk, wa,
                                           params.get("blink", 0.0),
                                           params.get("look_x", 0.0),
                                           params.get("smile", 0.0), geom)
@@ -270,7 +295,9 @@ def main():
     outside_changed = 0
     worst_outside = []
     for frame, params in (
-            (wide, {"mouth_open": 1.0, "wide": 1.0}),
+            (wide, {"mouth_open": 1.0, "mouth_shape": "wide"}),
+            (closed_sp, {"mouth_open": 0.0, "mouth_shape": "closed",
+                         "mouth_closed": 1.0}),
             (blink, {"blink": 1.0}),
             (look_l, {"look_x": -7.0}),
             (smile, {"smile": 1.0})):
@@ -359,6 +386,26 @@ def main():
           or "ONLY for the drawn fallback" in src,
           "docstring states lips.py is fallback-only; _draw_avatar path "
           "uses avatar_deform, never _draw_lips")
+
+    # --- 13. anime ignores mouth_closed; gui wires it in both paths --
+    # The anime file lives at the repo root on this VM but under
+    # assets/ in the PC source tree — try both, like gui.py does.
+    _anime_path = next(
+        (p for p in (HERE / "avatar.png", HERE / "assets" / "avatar.png")
+         if p.exists()), HERE / "avatar.png")
+    anime_base = Image.open(_anime_path).convert("RGBA").crop(
+        (430, 0, 1170, 680)).resize((420, 386), Image.LANCZOS)
+    anime_closed = ad.deform_avatar(
+        anime_base, mouth_open=0.0, mouth_shape="closed", mouth_closed=1.0,
+        profile="anime")
+    check("anime profile ignores mouth_closed (already a closed line)",
+          anime_closed is anime_base,
+          "deform_avatar(anime, mouth_closed=1) returns base unchanged")
+    mouth_closed_calls = src.count("mouth_closed=")
+    check("gui.py passes mouth_closed in both deform paths",
+          mouth_closed_calls >= 2,
+          f"mouth_closed= occurrences in gui.py: {mouth_closed_calls} "
+          f"(need _draw_avatar + _avatar_only_animate)")
 
     failed = [r for r in RESULTS if not r[1]]
     print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")

@@ -47,7 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import memory_import
 import continuous_memory
 
-KIDS = ["Aiden", "Anisa", "Ariya", "Asia", "Adonis", "De'Aris"]
+KIDS = ["Aiden", "Ariya", "Asia", "Adonis", "De'Aris", "Maliyah", "Avery"]
 CAP = memory_import.DEFAULT_MEMORY_CHARS  # 24000
 
 REAL_MEMORY = Path("/tmp/pc-memory.json")
@@ -83,7 +83,9 @@ def _build_synthetic(base_dir):
         ("Members", "[Adonis](../people/son.md): Lorenza's youngest child and 6-month-old son; one of the 6 kids."),
         ("Members", "[Ariya](../people/ariya.md): Lorenza's two-year-old daughter; one of the 6 kids."),
         ("People Index", "**De'Aris Session** — `~/memory/people/dearis-session.md` — Belleville East High School student whose attendance notices are delivered to Lorenza."),
-        ("People Index", "**Anisa** — `~/memory/people/anisa.md` — Ninth-grader who walked into the room during Lorenza's 2026-11-24 voice call; Lorenza had Oracle explain how it could help with her ninth-grade homework."),
+        ("People Index", "**Anisa** — `~/memory/people/anisa.md` — Ninth-grader; Candice's daughter, NOT one of Lorenza's children."),
+        ("People Index", "**Maliyah** — `~/memory/people/maliyah.md` — Lorenza's daughter; the sixth child named."),
+        ("People Index", "**Avery** — `~/memory/people/avery.md` — Lorenza's son, named 2026-11-25."),
     ]
     for j, (topic, text) in enumerate(members):
         imported[50 + j] = {"text": text, "topic": topic,
@@ -198,9 +200,27 @@ def main(argv):
 
     for kid in KIDS:
         check(f"kid present: {kid}", kid.lower() in low)
-    check("family roster line states all six kids as her children",
-          "lorenza's six children are aiden, anisa, ariya, asia, adonis, and de'aris." in low,
-          "roster line present" if "six children are" in low else "NO roster line — model will list only the 4 with stated relationships")
+    check("family roster line states all seven named kids",
+          "lorenza's seven named children are aiden, ariya, asia, adonis, de'aris, maliyah, and avery." in low,
+          "roster line present" if "seven named children are" in low else "NO roster line")
+    roster_lines = [ln for ln in prompt.splitlines()
+                    if "named children are" in ln.lower()]
+    roster_names = []
+    for ln in roster_lines:
+        m = re.search(r"named children are (.+?)\. \(Note:", ln)
+        if m:
+            roster_names.append(m.group(1))
+    check("roster line does NOT list Anisa as a child",
+          bool(roster_names) and all("anisa" not in n.lower()
+                                     for n in roster_names),
+          f"names listed: {roster_names[:1]} (Anisa appears only in "
+          f"the 'NOT one of her children' correction clause)")
+    check("roster line flags the 6-vs-7 count conflict (no child dropped)",
+          "seven named children conflicts" in low
+          and "do not drop any named child" in low)
+    check("Anisa correction present (Candice's daughter, not Lorenza's)",
+          "anisa is not one of her children" in low
+          and "candice's daughter" in low)
     check("Challenger fault: active exhaust valve",
           "active exhaust" in low)
     check("Challenger fault: right front turn signal",
@@ -227,7 +247,7 @@ def main(argv):
     # key facts — the fix is the ordering, not just the bigger cap.
     old_cap = memory_import.load_memory_text(base_dir, max_chars=6000)
     old_low = old_cap.lower()
-    check("at old 6,000-char cap, all 6 kids still present",
+    check("at old 6,000-char cap, all 7 kids still present",
           all(k.lower() in old_low for k in KIDS),
           f"{len(old_cap)} chars")
     check("at old 6,000-char cap, Challenger + Sonata still present",
@@ -242,7 +262,13 @@ def main(argv):
             ("What is wrong with my Challenger?",
              ["active exhaust", "turn signal"]),
             ("What is wrong with my Sonata?",
-             ["P1326", "knock sensor"])]:
+             ["P1326", "knock sensor"]),
+            ("Who is Anisa?",
+             ["Candice's daughter"]),
+            ("Who is Maliyah?",
+             ["Maliyah", "daughter"]),
+            ("Who is Avery?",
+             ["Avery", "son"])]:
         qp = memory_import.load_memory_text(base_dir, query=question).lower()
         missing = [n for n in needs if n.lower() not in qp]
         check(f"query {question!r} -> all needed facts present",
@@ -251,13 +277,13 @@ def main(argv):
 
     # The 'What do you remember?' path shares the same cap/prompt.
     remembered = continuous_memory.what_do_you_remember(base_dir)
-    check("what_do_you_remember: within cap, all 6 kids present",
+    check("what_do_you_remember: within cap, all 7 kids present",
           len(remembered) <= CAP
           and all(k.lower() in remembered.lower() for k in KIDS),
           f"{len(remembered)} chars")
 
     summary = "\n".join(memory_import.memory_summary_lines(base_dir))
-    check("memory summary (40 lines) names all 6 kids",
+    check("memory summary (40 lines) names all 7 kids",
           all(k.lower() in summary.lower() for k in KIDS))
 
     failed = [name for name, ok, _d in results if not ok]

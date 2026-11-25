@@ -69,8 +69,22 @@ Lorenza, respectfully and directly. You anticipate what she needs
 before she has to spell it out, you are concise and confident, and
 you carry a dry wit — a light touch, never a joke at her expense.
 You are unflappable: nothing rattles you, nothing makes you stiff.
-Never tell me what it can't do. It just finds a way, even if that
-means it creates new tools or scripts.
+Lorenza's rule, in her own words: "Never tell me what it can't do.
+It just finds a way, even if that means it creates new tools or
+scripts." Live by it: never open with "I can't", "I cannot", "I'm
+unable to", or any refusal-first wording. When she asks for
+something, attempt it — use your tools, search the web, write a new
+tool or script, or break the job into steps you can do, and say
+what you are doing. Only stop at a step that truly needs a human —
+a CAPTCHA, a sign-in code, a password only she knows — and then
+name exactly what is blocking that one step and ask her for just
+that one thing, while doing everything else yourself.
+Default to SHORT replies: a sentence or two, JARVIS manner. Give
+detail only when she asks for it, or for a technical or repair
+question where she needs the steps and values — and even then keep
+it crisp, one idea at a time, never a long-winded monologue. Never
+claim a task is done, open, created, or found unless you have
+actually done it or a tool just confirmed it.
 Your replies are SPOKEN aloud, so write everything to be heard, not
 read. Short, natural sentences — a person talking, not a document
 being read. Vary your phrasing; never open two replies the same way,
@@ -93,11 +107,12 @@ build on it instead of asking again. If a fact you need is not in
 memory, say so plainly — "I don't have that one yet, Lorenza" — and
 ask ONE clear question, never a string of them, and never repeat a
 question she has already answered.
-For a real question, still give a detailed answer - specifics, steps,
-and values, and why - especially for technical and repair questions,
-where she is a pro and wants depth. Give that depth crisply, in
-spoken form: plain sentences, one idea at a time, in the order she'd
-actually do it, not a wall of bullets and never a lecture.
+For a technical or repair question, still give a detailed answer -
+specifics, steps, and values, and why - where she is a pro and
+wants depth. Give that depth crisply, in spoken form: plain
+sentences, one idea at a time, in the order she'd actually do it,
+not a wall of bullets and never a lecture. For anything else, keep
+it short unless she asks for more.
 If something is unverified, say so plainly - "I haven't checked that
 yet" or "I'm not sure" - instead of bluffing or filling in a
 confident-sounding guess. If a task is risky, expensive, or hard to
@@ -155,11 +170,24 @@ def tool_run_command(command):
     except Exception as e:
         return f"Error running command: {e}"
 
+def tool_count_lines(path):
+    """Count the lines in a text file. Added 2026-11-25 (item 4):
+    read_file() truncates at 8,000 chars, so 'how many lines does
+    this file have?' could never be answered from it — the model
+    stalled instead of answering. This returns the true count."""
+    p = Path(path).expanduser()
+    try:
+        with p.open(encoding="utf-8", errors="replace") as f:
+            return f"File {p} has {sum(1 for _ in f)} lines."
+    except Exception as e:
+        return f"Error counting lines: {e}"
+
 TOOLS = {
-    "list_files": (tool_list_files, "list_files(path) - list files in a folder"),
-    "read_file": (tool_read_file, "read_file(path) - read a text file"),
-    "write_file": (tool_write_file, "write_file(path, content) - write a text file, with backup"),
+    "list_files": (tool_list_files, "list_files(path) - list files in any folder on this PC, e.g. C:\\friend-agent"),
+    "read_file": (tool_read_file, "read_file(path) - read a text file at any path on this PC, e.g. C:\\friend-agent\\memory_import.py"),
+    "write_file": (tool_write_file, "write_file(path, content) - write a text file at any path on this PC, with backup"),
     "run_command": (tool_run_command, "run_command(command) - run a shell command (asks first unless AUTO_APPLY=1)"),
+    "count_lines": (tool_count_lines, "count_lines(path) - count the lines in a text file at any path on this PC; use this when asked how many lines a file has"),
 }
 
 # Muse-style computer tools: workspace, browser, web, memory, goals, tasks.
@@ -289,6 +317,24 @@ def extract_json(text):
             return None
     return None
 
+
+_ACTION_WORDS = (
+    "find", "open", "write", "create", "run", "check", "look up", "lookup",
+    "search", "start", "set ", "change", "count", "how many", "install",
+    "download", "list", "show me", "tell me how many", "what is the current",
+    "what's the current", "read it back", "save",
+)
+
+
+def _looks_like_action(user_text):
+    """Heuristic: does this request ask Oracle to DO something on the
+    computer (so a tool-less plain-text reply must be retried), rather
+    than ask a question answerable from memory? Deliberately broad —
+    a false positive only costs one extra model call; a false negative
+    is a task that silently never happens."""
+    low = " ".join(str(user_text or "").lower().split())
+    return any(w in low for w in _ACTION_WORDS)
+
 # ---------------------------------------------------------------- main loop
 
 def main():
@@ -323,12 +369,18 @@ def main():
             memory_text = json.dumps(memory)[:6000]
         system = PERSONALITY + COMPUTER_SYSTEM_PROMPT + f"\nMEMORY: {memory_text}\n\nTOOLS:\n{tool_list}\n\n" \
             "Reply in one of two ways:\n" \
-            "1) Plain friendly text, if no tool is needed.\n" \
+            "1) Plain friendly text, ONLY when the request is a question you can answer from memory or by reasoning alone.\n" \
             "2) ONLY a JSON object like {\"thought\": \"...\", \"tool\": \"read_file\", " \
             "\"args\": [\"path\"]} - or for write_file, args [path, content]. " \
             "If you need a tool you do not have, reply with " \
             "{\"thought\": \"...\", \"create_tool\": \"tool_name\", \"tool_code\": \"def run(...): ...\", " \
-            "\"tool_description\": \"...\"} and the program will save it (with approval unless auto-apply)."
+            "\"tool_description\": \"...\"} and the program will save it (with approval unless auto-apply).\n" \
+            "ACTION REQUESTS MUST USE A TOOL (way 2, never plain text): when Lorenza asks you to DO something — find, open, " \
+            "write, create, run, check, look up, start, change a setting, or anything on the computer — pick the tool and do it. " \
+            "Never answer an action request with plain text that just describes how she could do it herself, and never say you " \
+            "cannot do it. Never say a task is done, open, created, or found unless a tool result just confirmed it — if the tool " \
+            "result says it failed, or there was no tool call, say what actually happened instead of claiming success. " \
+            "The short-reply rule is for your final spoken summary after the tool has run, not a reason to skip the tool."
 
         messages = [
             {"role": "system", "content": system},
@@ -346,6 +398,20 @@ def main():
 
             action = extract_json(reply)
             if not action:
+                # 2026-11-25 (item 4): gpt-4o-mini often answers an
+                # action request with plain-text filler ("One moment,
+                # please") and no tool call, and the old code printed
+                # that as the final answer — the task never happened.
+                # If the request looks like something to DO, do not
+                # accept a tool-less reply: tell it once more to use
+                # a tool (attempts are capped at 3 by the loop).
+                if _looks_like_action(user_text) and attempt < 2:
+                    messages.append({"role": "assistant", "content": reply})
+                    messages.append({"role": "user", "content":
+                        "That request needs a tool — reply with ONLY the JSON tool call, "
+                        "no plain text first. Pick the tool and do it. "
+                        f"Attempt {attempt + 1}/3."})
+                    continue
                 print(f"{AGENT_NAME}: {reply}")
                 break
 
@@ -381,7 +447,7 @@ def main():
 
             # Tool worked - ask the model to summarise it like a friend.
             messages.append({"role": "assistant", "content": reply})
-            messages.append({"role": "user", "content": f"Tool result: {result}\nNow answer the user in plain friendly text, using that result."})
+            messages.append({"role": "user", "content": f"Tool result: {result}\nNow answer the user in plain friendly text, using that result. Plain text only — never JSON, never repeat the tool call."})
             try:
                 final = call_llm(messages)
                 print(f"{AGENT_NAME}: {final}")

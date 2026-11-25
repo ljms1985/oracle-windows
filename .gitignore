@@ -14,3 +14,5 @@ build/
 *.spec
 !oracle-windows.spec
 !oracle-windows-debug.spec
+gui.py.gz
+voice-listening.log

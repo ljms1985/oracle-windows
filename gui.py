@@ -249,6 +249,21 @@ class OracleGUI:
         self._lip_shape = "closed"  # closed/slight/open/wide/round/fv
         self._typing_done = False
         self._speech_done = True
+        # --- Interrupt token (v1.0.10 fix, item 3, 2026-11-25) ---
+        # Every reply gets the token value current when it started;
+        # interrupt_speaking() bumps it. _ask discards a reply whose
+        # token went stale (interrupted during generation) and
+        # _typewriter aborts a stale chain mid-typing, so an
+        # interrupted reply never reaches the screen or the speaker.
+        self._reply_token = 0
+        # Post-interrupt listen blackout (item 3, 2026-11-25): after
+        # Lorenza stops a reply, the mic still rings with the
+        # stopped TTS tail and Whisper confabulates on it ("Horray!",
+        # "I'm in!") — without a blackout the agent answers its own
+        # echo and starts talking again on its own a second after
+        # being stopped. interrupt_speaking() sets this to now+3s;
+        # the listen loop drops anything heard before it.
+        self._interrupt_until = 0.0
         # --- Avatar animation director (v1.0.9, avatar_anim.py) ---
         # Breathing, natural blinking, wandering gaze, nods, head
         # tilt, expressions and laugh/surprise reactions — the phone
@@ -305,6 +320,14 @@ class OracleGUI:
         # button hides the main box and leaves just the avatar.
         try:
             self.root.bind("<Unmap>", self._on_unmap)
+        except Exception:
+            pass
+        # Esc stops Oracle mid-sentence, same as the Stop button
+        # (v1.0.10 fix, item 3). bind_all so it works from the entry
+        # box, the buttons, and the canvas alike.
+        try:
+            self.root.bind_all("<Escape>",
+                               lambda e: self.interrupt_speaking("keyboard"))
         except Exception:
             pass
         self.animate()
@@ -530,6 +553,15 @@ class OracleGUI:
         self.listen_btn.pack(fill="x", pady=2)
         self.speak_btn = self._btn(voice_card, "Speak replies: ON", self.toggle_speak)
         self.speak_btn.pack(fill="x", pady=2)
+        # Stop / shut up (v1.0.10 fix, item 3, 2026-11-25, Lorenza):
+        # when Oracle is long-winded she must be able to cut it off
+        # at once. This button, the Esc key, and saying "stop" /
+        # "shut up" / "be quiet" all do the same thing: stop TTS
+        # playback now, clear the speech queue, and stop the model
+        # from continuing that reply (see interrupt_speaking).
+        self.stop_btn = self._btn(voice_card, "■  Stop speaking  (Esc)",
+                                  lambda: self.interrupt_speaking("button"))
+        self.stop_btn.pack(fill="x", pady=2)
         # Voice engine (2026-11-24): OpenAI nova (default), ElevenLabs,
         # or the offline system voice. Saved in oracle_settings.json;
         # takes effect on the next reply. ElevenLabs needs its key
@@ -932,10 +964,16 @@ class OracleGUI:
         if (avatar_deform_mod is not None
                 and getattr(self, "_avatar_pil", None) is not None):
             try:
+                # mouth_closed (pencil only): while speaking, a low
+                # level compresses the drawn grin into a thin smile
+                # and a high level stretches it open — the visible
+                # close/open cycle (v1.0.10 fix, item 2). At rest
+                # the portrait is untouched (closed = 0).
                 frame = avatar_deform_mod.deform_avatar(
                     self._avatar_pil,
                     mouth_open=self.lip_level if self.mode == "speaking" else 0.0,
                     mouth_shape=self._lip_shape if self.mode == "speaking" else "closed",
+                    mouth_closed=(1.0 - self.lip_level) if self.mode == "speaking" else 0.0,
                     blink=blink, look_x=look_x,
                     tilt_deg=tilt, smile=smile,
                     profile=getattr(self, "_avatar_profile", "anime"))
@@ -1165,6 +1203,58 @@ class OracleGUI:
         self._lip_target_level = 0.0
         self._lip_shape = "closed"
         self._maybe_finish_speaking()
+
+    def interrupt_speaking(self, source="button"):
+        """Stop Oracle mid-reply, NOW — from the Stop button, the Esc
+        key, or a spoken "stop" / "shut up" / "be quiet" (item 3,
+        2026-11-25, Lorenza: she must be able to cut it off when it
+        is long-winded). Must run on the main thread (button / key
+        callbacks already do; the listen loop routes here via
+        _post_ui). Does three things at once:
+          1. TTS playback stops: voice.stop_speaking() sets the stop
+             event the playback loop checks every ~23 ms chunk, and
+             stops SAPI too — audio is gone within a fraction of a
+             second, and no queued speech resumes (speak() checks
+             the event before every chunk and every sentence pause).
+          2. The reply stops generating/typing: the token bump makes
+             _ask discard a reply still being generated and makes
+             _typewriter abort its chain, so nothing more is typed
+             or spoken from that reply.
+          3. The GUI goes back to idle at once, mouth closed.
+        Safe to call when nothing is speaking (a stray Esc / "stop"
+        while idle just stays idle)."""
+        self._reply_token += 1
+        try:
+            if voice_mod is not None:
+                voice_mod.stop_speaking()
+        except Exception:
+            pass
+        # Blackout the mic for 3 s after the stop (see __init__):
+        # the stopped TTS tail is still in the air, and anything
+        # the listener picks up in that window is echo, not Lorenza.
+        try:
+            self._interrupt_until = time.monotonic() + 3.0
+        except Exception:
+            pass
+        self._lip_target_level = 0.0
+        self._lip_shape = "closed"
+        self.lip_level = 0.0
+        self._typing_done = True
+        self._speech_done = True
+        was_busy = self.busy
+        self.busy = False
+        self.mode = "idle"
+        self._ask_started = None
+        try:
+            self.status.config(text="● ONLINE", fg=self.t["good"])
+        except Exception:
+            pass
+        if was_busy:
+            try:
+                self._log_listening(f"INTERRUPTED ({source}): speech stopped, reply discarded")
+            except Exception:
+                pass
+            self.append("system", "Stopped.")
 
     def _maybe_finish_speaking(self):
         """Only go back to IDLE (and clear busy) once BOTH the reply
@@ -1721,6 +1811,8 @@ class OracleGUI:
         canvas.bind("<B1-Motion>", _drag)
         canvas.bind("<ButtonRelease-1>", _release)
         win.bind("<Button-3>", lambda _e: self._restore_from_avatar())
+        # Esc stops Oracle mid-sentence here too (item 3).
+        win.bind("<Escape>", lambda _e: self.interrupt_speaking("keyboard"))
         self._avatar_only_animate()
 
     def _avatar_only_animate(self):
@@ -1750,6 +1842,7 @@ class OracleGUI:
                         self._avatar_pil,
                         mouth_open=self.lip_level if self.mode == "speaking" else 0.0,
                         mouth_shape=self._lip_shape if self.mode == "speaking" else "closed",
+                        mouth_closed=(1.0 - self.lip_level) if self.mode == "speaking" else 0.0,
                         blink=(anim or {}).get("blink", 0.0),
                         look_x=(anim or {}).get("look_x", 0.0),
                         tilt_deg=(anim or {}).get("tilt_deg", 0.0),
@@ -1823,8 +1916,66 @@ class OracleGUI:
     def _listen_loop(self):
         while self.always_listen:
             if self.busy:
-                import time as _time
-                _time.sleep(0.5)
+                if voice_mod is None:
+                    time.sleep(0.5)
+                    continue
+                # While a reply is speaking, the mic stays open ONLY
+                # for interrupt phrases (item 3): the old code slept
+                # through the whole reply, so "stop" / "shut up"
+                # could never be heard mid-speech. Short listen
+                # cycles (2 s wait, 4 s phrase) keep the ear open;
+                # anything that is not a short interrupt phrase is
+                # ignored, never answered. Honest limit: this is the
+                # Whisper path, so a spoken interrupt lands a few
+                # seconds after the words, not instantly — the Stop
+                # button and the Esc key are the instant routes.
+                # While only THINKING (generating, not yet speaking)
+                # there is nothing to stop mid-audio, but the token
+                # in _ask still discards the reply if she stops it.
+                if self.mode == "speaking" or (
+                        voice_mod is not None
+                        and voice_mod.is_speaking()):
+                    # Token guard: a listen cycle that started during
+                    # this reply must not deliver the agent's own
+                    # words as a "user" utterance if Lorenza stopped
+                    # the reply while the cycle was in flight.
+                    listen_token = self._reply_token
+                    try:
+                        heard = voice_mod.listen_once(
+                            timeout=2, phrase_time_limit=4)
+                    except Exception:
+                        heard = ""
+                    if heard:
+                        try:
+                            engine = voice_mod.last_stt_engine()
+                        except Exception:
+                            engine = ""
+                        self._log_listening(
+                            f"HEARD-WHILE-SPEAKING ({engine or 'stt'}): {heard}")
+                    if listen_token != self._reply_token:
+                        # Interrupted mid-listen: drop whatever this
+                        # cycle caught — it is the stopped reply's
+                        # own audio, not a new thing Lorenza said.
+                        continue
+                    if heard and voice_mod.contains_interrupt_command(heard):
+                        self._log_listening(
+                            f"INTERRUPT HEARD: {heard!r}")
+                        self._post_ui(
+                            lambda: self.interrupt_speaking("voice"))
+                        continue
+                    time.sleep(0.2)
+                    continue
+                time.sleep(0.5)
+                continue
+            if time.monotonic() < getattr(self, "_interrupt_until", 0.0):
+                # Post-interrupt blackout (see interrupt_speaking):
+                # still listen (the call blocks on audio), but drop
+                # the result — it is the stopped reply's echo.
+                _dropped = voice_mod.listen_once(timeout=2,
+                                                 phrase_time_limit=4)
+                if _dropped:
+                    self._log_listening(
+                        f"HEARD dropped (post-interrupt blackout): {_dropped!r}")
                 continue
             heard = voice_mod.listen_once(timeout=10, phrase_time_limit=30)
             if heard and self.always_listen:
@@ -2599,6 +2750,14 @@ class OracleGUI:
         self.handle_user_text(user_text)
 
     def handle_user_text(self, user_text, spoken=False):
+        # Interrupt first (item 3): "stop" / "shut up" / "be quiet"
+        # while a reply is going must cut it off, not be dropped by
+        # the busy-guard below and not be answered as a question.
+        if (voice_mod is not None
+                and voice_mod.is_interrupt_phrase(user_text)
+                and (self.busy or self.mode == "speaking")):
+            self.interrupt_speaking("voice" if spoken else "typed")
+            return
         # Camera tracking / face commands are handled locally, without
         # calling the LLM (v1.0.8, items 7 + 9).
         if self._handle_camera_command(user_text, spoken=spoken):
@@ -2649,6 +2808,12 @@ class OracleGUI:
         # try/finally guarantees busy always clears, and every
         # outcome is logged, so a dead reply thread can no longer
         # leave the GUI stuck on THINKING forever.
+        # Interrupt token (item 3): captured now; if Lorenza stops
+        # this reply while it is still generating, the token goes
+        # stale and the reply is discarded below, never typed or
+        # spoken. The LLM HTTP call itself cannot be cancelled
+        # mid-flight (no cancel API), but its output is dropped.
+        token = self._reply_token
         try:
             # "Get to know me" is a local conversation mode, not a chat
             # question: one question at a time, skip/stop any time.
@@ -2692,6 +2857,21 @@ class OracleGUI:
                     except Exception:
                         memory_text = ""
                 system = PERSONALITY
+                # Chat-window honesty (2026-11-25, item 4): this GUI
+                # reply path has no tool execution, unlike agent.py's
+                # CLI loop — so the model must never claim it opened
+                # a program, wrote a file, or found a file when it
+                # has not. It still attempts, in the way it can here:
+                # exact steps, the exact command, or the exact file
+                # content, briefly — never a refusal, never a false
+                # "done". (A GUI tool loop is the remaining work if
+                # Lorenza wants the chat window itself to execute.)
+                system += ("\n\nYou are answering in the chat window: you "
+                           "cannot run programs, open files, or write files "
+                           "from here, so never claim such a task is already "
+                           "done. Instead attempt it in the way you can: "
+                           "give the exact steps, the exact command, or the "
+                           "exact file content, briefly.")
                 if memory_text:
                     system += ("\n\nWHAT YOU KNOW ABOUT LORENZA (from Muse conversations "
                                "and your own memory — use it, refer to it naturally, "
@@ -2728,20 +2908,38 @@ class OracleGUI:
                     self._post_ui(self._refresh_memory_label)
                 except Exception:
                     pass
-            self._post_ui(lambda r=reply: self._typewriter(r))
+            if token != self._reply_token:
+                # Interrupted while generating: drop this reply
+                # entirely — do not type it, do not speak it.
+                self._log_listening("ASK DISCARDED: reply interrupted during generation")
+                return
+            self._post_ui(lambda r=reply, t=token: self._typewriter(r, token=t))
         except Exception as e:
             self._log_listening(f"ASK FAILED: {e}")
-            self._post_ui(lambda err=e: self._typewriter(
-                f"I hit a problem answering that: {err}. Please try again."))
+            self._post_ui(lambda err=e, t=token: self._typewriter(
+                f"I hit a problem answering that: {err}. Please try again.",
+                token=t))
         finally:
             # busy is cleared by _typewriter when the reply finishes
             # typing; the watchdog in _tick_clock clears it if the
             # reply never reaches the screen.
             pass
 
-    def _typewriter(self, full_text, idx=0):
+    def _typewriter(self, full_text, idx=0, token=None):
         # Runs on the main thread only (via _post_ui). Any exception
         # here must still clear busy, or the GUI sticks on THINKING.
+        # Interrupt (item 3): a stale token means Lorenza stopped
+        # this reply — abort the chain at once, typing and speaking
+        # nothing more from it. A caller that passes no token gets the
+        # CURRENT token captured at chain start, so every reply — the
+        # _ask path and direct callers such as pan-and-describe — is
+        # interruptible. (2026-11-25: a typed-stop test caught the
+        # pan-describe path typing through a stop because token=None
+        # used to bypass the check entirely.)
+        if token is None:
+            token = self._reply_token
+        if token != self._reply_token:
+            return
         try:
             if idx == 0:
                 self.mode = "speaking"
@@ -2765,7 +2963,7 @@ class OracleGUI:
                 self.text.insert("end", chunk, "oracle")
                 self.text.configure(state="disabled")
                 self.text.see("end")
-                self.root.after(18, lambda: self._typewriter(full_text, idx + 3))
+                self.root.after(18, lambda: self._typewriter(full_text, idx + 3, token=token))
             else:
                 self.text.configure(state="normal")
                 self.text.insert("end", "\n\n")

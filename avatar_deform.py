@@ -61,6 +61,17 @@ Honest limits:
   in, fv barely opens) and the drawn teeth stretch with it. The
   warp cannot close the smile into a thin lip line the way a real
   mouth closes — say so plainly; the resting smile is the character.
+  LIVE FINDING 2026-11-25 (screenshot proof on Lorenza's PC): the
+  deform IS applied while speaking — the mouth region changes ~5x
+  more than a static control region — but the stretch alone is
+  perceptually invisible: the grin never closes, so there is no
+  open/closed cycle for a viewer to see, and Lorenza rightly
+  reports the mouth "stays closed". Fix (same deform, no overlay):
+  while speaking, a low speech level now COMPRESSES the grin
+  (``mouth_closed``) into a thin smile line, and a high level
+  stretches it open — a real visible close/open cycle of the
+  image's own pixels. At rest (not speaking) the portrait is
+  untouched: the drawn grin is the idle face.
 
 The warp is an inverse map: for each destination grid corner
 (x, y) the source sample is (x - dx, y - dy), where (dx, dy) is
@@ -80,12 +91,14 @@ class _Geom(object):
     __slots__ = ("w", "h", "face_cx", "face_cy", "mouth_cx", "mouth_cy",
                  "eye_centers", "eye_y0", "eye_y1", "mouth_y0",
                  "mouth_y1", "mouth_half_w", "eye_half", "x_cuts",
-                 "y_cuts", "mouth_stretch", "wide_stretch", "lid_y")
+                 "y_cuts", "mouth_stretch", "wide_stretch", "lid_y",
+                 "close_strength")
 
     def __init__(self, w, h, face_cx, face_cy, mouth_cx, mouth_cy,
                  eye_centers, eye_y0, eye_y1, mouth_y0, mouth_y1,
                  mouth_half_w, eye_half, x_cuts, y_cuts,
-                 mouth_stretch=0.75, wide_stretch=0.25, lid_y=None):
+                 mouth_stretch=0.75, wide_stretch=0.25, lid_y=None,
+                 close_strength=0.0):
         self.w, self.h = w, h
         self.face_cx, self.face_cy = face_cx, face_cy
         self.mouth_cx, self.mouth_cy = mouth_cx, mouth_cy
@@ -103,9 +116,18 @@ class _Geom(object):
         # toward on a blink (None = the eye line itself, which is
         # right for the anime's lash line but wrong for the pencil
         # — its eye line runs through the tall dark pupils).
+        # close_strength: how hard a low speech level COMPRESSES
+        # the mouth toward the lip line (k > 1). The anime's mouth
+        # is already a closed line, so 0.0 (no compression). The
+        # pencil's resting mouth is a wide open grin, so without
+        # compression it can never visibly close: 0.45 squeezes
+        # the 34 px mouth band to ~19 px — a thin smile line —
+        # while a high level still stretches it open. This is the
+        # same mesh warp, not an overlay: the image's own pixels.
         self.mouth_stretch = mouth_stretch
         self.wide_stretch = wide_stretch
         self.lid_y = lid_y
+        self.close_strength = close_strength
 
 
 PROFILES = {
@@ -119,7 +141,8 @@ PROFILES = {
         ((178, 156), (241, 158)), 144, 170, 192, 226, 31, 28,
         (0, 120, 148, 178, 196, 209, 224, 241, 262, 300, 410),
         (0, 120, 144, 157, 170, 192, 209, 226, 260, 300, 409),
-        mouth_stretch=0.35, wide_stretch=0.12, lid_y=146),
+        mouth_stretch=0.35, wide_stretch=0.12, lid_y=146,
+        close_strength=0.45),
 }
 
 # Render-space geometry for the default (anime) profile.
@@ -156,7 +179,7 @@ def _bump(v, centre, half_width):
     return max(0.0, 1.0 - d) if d < 1.0 else 0.0
 
 
-def _displacement(x, y, mouth_open, wide_factor, blink, look_x, smile,
+def _displacement(x, y, mouth_k, wide_amount, blink, look_x, smile,
                   geom):
     """Forward displacement (dx, dy) of the source pixel at (x, y).
 
@@ -166,8 +189,11 @@ def _displacement(x, y, mouth_open, wide_factor, blink, look_x, smile,
     peaked inside a mesh cell is averaged away by the interpolation
     and the eye never fully closes / the mouth never fully opens.
     * Mouth: dest rows show source rows squeezed toward the lip
-      line (k < 1 stretches the mouth open); corners move out
-      (wide) or in (round); smile lifts the corners.
+      line (k < 1 stretches the mouth open; k > 1 compresses it
+      toward the lip line — the pencil's close, since its resting
+      mouth is an open grin); corners move out (wide_amount > 0)
+      or in (wide_amount < 0, the pencil's close); smile lifts the
+      corners.
     * Blink: dest rows show source rows squeezed toward the eye
       line (k = 1 - blink); at blink = 1 the whole eye band samples
       the eye line itself — the painted eye is shut.
@@ -176,15 +202,14 @@ def _displacement(x, y, mouth_open, wide_factor, blink, look_x, smile,
     """
     dx = 0.0
     dy = 0.0
-    # --- mouth (linear stretch around the lip line) ---
-    if mouth_open > 0.0 or smile > 0.0:
+    # --- mouth (linear stretch/compress around the lip line) ---
+    if mouth_k != 1.0 or wide_amount != 0.0 or smile > 0.0:
         wx = _bump(x, geom.mouth_cx, 60)  # local to the mouth width
         if wx > 0.0:
-            if geom.mouth_y0 <= y <= geom.mouth_y1 and mouth_open > 0.0:
-                k_mouth = 1.0 - geom.mouth_stretch * mouth_open
-                dy += (y - geom.mouth_cy) * (1.0 - k_mouth) * wx
-            if mouth_open > 0.0 and wide_factor != 0.0:
-                kx = 1.0 - geom.wide_stretch * mouth_open * wide_factor
+            if geom.mouth_y0 <= y <= geom.mouth_y1 and mouth_k != 1.0:
+                dy += (y - geom.mouth_cy) * (1.0 - mouth_k) * wx
+            if wide_amount != 0.0:
+                kx = 1.0 - geom.wide_stretch * wide_amount
                 dx += (x - geom.mouth_cx) * (1.0 - kx) * _bump(
                     y, geom.mouth_cy, 25)
             if smile > 0.0:
@@ -211,7 +236,24 @@ def _displacement(x, y, mouth_open, wide_factor, blink, look_x, smile,
     return dx, dy
 
 
-def _mesh(mouth_open, wide_factor, blink, look_x, smile, geom):
+def _mouth_params(geom, mouth_open, mouth_shape, mouth_closed):
+    """(mouth_k, wide_amount) for one frame: the vertical mesh scale
+    (k < 1 stretches the mouth open, k > 1 compresses it toward
+    the lip line) and the signed horizontal corner pull (-1..1).
+    Shared by deform_avatar() and the tests, so the warp the tests
+    measure is the warp the GUI draws."""
+    open_v, wide_f = _SHAPE_PARAMS.get(mouth_shape, (0.0, 0.0))
+    open_eff = mouth_open * open_v
+    mouth_k = 1.0 - geom.mouth_stretch * open_eff \
+        + geom.close_strength * mouth_closed
+    mouth_k = max(0.4, min(1.6, mouth_k))
+    wide_amount = max(-1.0, min(1.0, wide_f * open_eff
+                                 - 0.8 * mouth_closed
+                                 * (1.0 if geom.close_strength else 0.0)))
+    return mouth_k, wide_amount
+
+
+def _mesh(mouth_k, wide_amount, blink, look_x, smile, geom):
     """PIL MESH list for the current frame's warp.
 
     Destination boxes tile the whole image; each box's quad is the
@@ -230,7 +272,7 @@ def _mesh(mouth_open, wide_factor, blink, look_x, smile, geom):
             x0, x1 = geom.x_cuts[i], geom.x_cuts[i + 1]
             corners = []
             for (cx, cy) in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
-                dx, dy = _displacement(cx, cy, mouth_open, wide_factor,
+                dx, dy = _displacement(cx, cy, mouth_k, wide_amount,
                                        blink, look_x, smile, geom)
                 corners.append((cx - dx, cy - dy))
             nw, ne, se, sw = corners
@@ -244,7 +286,7 @@ def _mesh(mouth_open, wide_factor, blink, look_x, smile, geom):
 
 def deform_avatar(base, *, mouth_open=0.0, mouth_shape="closed",
                   blink=0.0, look_x=0.0, look_y=0.0, tilt_deg=0.0,
-                  smile=0.0, profile="anime"):
+                  smile=0.0, profile="anime", mouth_closed=0.0):
     """Return a new RGBA image: ``base`` (the rendered avatar, in the
     profile's render space — 420x386 anime, 410x409 pencil) with its
     own mouth/eyes warped and the whole head tilted.
@@ -261,6 +303,16 @@ def deform_avatar(base, *, mouth_open=0.0, mouth_shape="closed",
       tall vs wide the opening is. Closed + 0.0 returns ``base``
       unchanged (same object — callers must not mutate it). For the
       pencil profile, "closed" is the drawn open smile itself.
+    * ``mouth_closed`` 0..1 is how firmly the mouth is shut WHILE
+      SPEAKING (the GUI passes 1 - lip_level while speaking, 0
+      otherwise). Only the pencil profile uses it: its resting
+      mouth is a wide open grin, so a low speech level must
+      COMPRESS that grin into a thin smile line (k > 1) or the
+      mouth can never visibly close — the stretch-only warp was
+      proven live on 2026-11-25 to move the mouth pixels without
+      any visible open/close cycle. The anime profile ignores it
+      (its resting mouth is already a closed line). Still the same
+      mesh warp of the image's own pixels — never an overlay.
     * ``blink`` 0..1 closes the painted eyes themselves.
     * ``look_x``/``look_y`` shift the gaze (eye band only, subtle).
       look_y is accepted for API symmetry and currently unused —
@@ -274,16 +326,18 @@ def deform_avatar(base, *, mouth_open=0.0, mouth_shape="closed",
     """
     geom = PROFILES.get(profile, PROFILES["anime"])
     mouth_open = max(0.0, min(1.0, float(mouth_open)))
+    mouth_closed = max(0.0, min(1.0, float(mouth_closed)))
     blink = max(0.0, min(1.0, float(blink)))
     smile = max(0.0, min(1.0, float(smile)))
     tilt_deg = max(-10.0, min(10.0, float(tilt_deg)))
-    open_v, wide_f = _SHAPE_PARAMS.get(mouth_shape, (0.0, 0.0))
-    mouth_open = mouth_open * open_v
-    if mouth_open < 0.01 and blink < 0.02 and smile < 0.02 \
+    mouth_k, wide_amount = _mouth_params(geom, mouth_open, mouth_shape,
+                                         mouth_closed)
+    if abs(mouth_k - 1.0) < 0.01 and abs(wide_amount) < 0.02 \
+            and blink < 0.02 and smile < 0.02 \
             and abs(tilt_deg) < 0.05 and abs(look_x) < 0.1:
         return base
     img = base.transform(base.size, Image.MESH,
-                         _mesh(mouth_open, wide_f, blink, look_x, smile,
+                         _mesh(mouth_k, wide_amount, blink, look_x, smile,
                                geom),
                          Image.BILINEAR)
     if abs(tilt_deg) >= 0.05:

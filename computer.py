@@ -224,17 +224,38 @@ def web_fetch(url):
         return f"Error fetching page: {e}"
 
 def web_search(query):
-    """No-API-key search via DuckDuckGo lite. Returns titles + links."""
+    """No-API-key search via DuckDuckGo lite. Returns titles + links.
+
+    Fixed 2026-11-25: DDG lite now marks results with single quotes
+    (class='result-link') and serves the results page only to a
+    browser User-Agent — the old double-quote regex + "Oracle-agent"
+    UA returned zero matches on the live PC even though the fetch
+    succeeded. The matcher below accepts either quote style and
+    href before or after the class."""
     try:
         q = urllib.parse.quote_plus(query)
-        req = urllib.request.Request(f"https://lite.duckduckgo.com/lite/?q={q}",
-                                     headers={"User-Agent": "Oracle-agent/1.0"})
+        req = urllib.request.Request(
+            f"https://lite.duckduckgo.com/lite/?q={q}",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                  "Chrome/120.0 Safari/537.36"})
         with urllib.request.urlopen(req, timeout=30) as resp:
             html = resp.read().decode("utf-8", errors="replace")
         results = []
-        for m in re.finditer(r'class="result-link"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, re.DOTALL):
-            title = re.sub(r"<[^>]+>", "", m.group(2)).strip()
-            results.append(f"- {title}: {urllib.parse.unquote(m.group(1))}")
+        for m in re.finditer(r"<a\s[^>]*?result-link[^>]*?>(.*?)</a>",
+                             html, re.DOTALL | re.IGNORECASE):
+            href_m = re.search(r"""href=(["'])(.*?)\1""", m.group(0))
+            if not href_m:
+                continue
+            title = re.sub(r"<[^>]+>", "", m.group(1)).strip()
+            title = (title.replace("&amp;", "&").replace("&quot;", '"')
+                     .replace("&#x27;", "'").replace("&#39;", "'")
+                     .replace("&lt;", "<").replace("&gt;", ">"))
+            href = urllib.parse.unquote(href_m.group(2))
+            if href.startswith("//"):
+                href = "https:" + href
+            if title and href:
+                results.append(f"- {title}: {href}")
             if len(results) >= 10:
                 break
         return "\n".join(results) if results else "No search results returned. Try a different query."
@@ -290,6 +311,68 @@ def browser_close():
             pass
     _browser.update(page=None, playwright=None, browser=None)
     return "Browser closed. Its profile and cookies are kept in workspace/browser-profile/."
+
+
+# ---------------------------------------------------------------- programs
+# Added 2026-11-25 (item 4): the agent had no "open a program" tool —
+# "Open Notepad" could only go through a raw shell command, and the
+# model sometimes claimed it was open when no process was running.
+# open_program() launches the program and only reports success when
+# its process is actually found running afterwards. From a background
+# session with no desktop (e.g. an SSH session) Windows cannot show
+# a window, so it then says so honestly instead of claiming success.
+
+_PROGRAMS = {
+    "notepad": "notepad.exe",
+    "calculator": "calc.exe",
+    "paint": "mspaint.exe",
+    "wordpad": "wordpad.exe",
+    "command prompt": "cmd.exe",
+    "cmd": "cmd.exe",
+    "powershell": "powershell.exe",
+}
+
+
+def open_program(name):
+    """Open a program by name (e.g. "Notepad") and verify it is running.
+
+    Returns success ONLY when the program's process is found running
+    afterwards. A launch that produces no process reports the failure
+    plainly — never "it is open" when it is not."""
+    key = " ".join(str(name or "").split()).lower()
+    target = _PROGRAMS.get(key, key)
+    if not target.lower().endswith(".exe"):
+        target += ".exe"
+    exe = target.split("\\")[-1]
+    try:
+        subprocess.Popen([target], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                         close_fds=True)
+    except Exception as e:
+        return f"Could not open {name}: {e}"
+    # Verify the process is still running twice: a GUI program
+    # launched from a background session with no desktop can start
+    # and then die within seconds (seen live 2026-11-25: notepad.exe
+    # was present at +2s and gone a minute later), so a single early
+    # check would falsely report success. It must still be alive
+    # at ~8s to count as open.
+    for _wait in (2, 6):
+        time.sleep(_wait)
+        try:
+            check = subprocess.run(f'tasklist /FI "IMAGENAME eq {exe}"',
+                                   shell=True, capture_output=True, text=True,
+                                   timeout=15)
+            out = check.stdout or ""
+            if exe.lower() not in out.lower() or "no tasks" in out.lower():
+                return (f"I tried to open {name}, but no {exe} process is "
+                        "running afterwards — a window cannot be opened "
+                        "from this background session. Ask me from the "
+                        "Oracle window on the desktop, and I will open it "
+                        "there.")
+        except Exception:
+            pass
+    log_event(f"opened program {name} ({exe})")
+    return f"Opened {name} ({exe}) — it is running."
 
 
 # ---------------------------------------------------------------- job applications
@@ -974,6 +1057,7 @@ COMPUTER_TOOLS = {
     "browser_goto": (browser_goto, "browser_goto(url) - open a page in Oracle's browser"),
     "browser_text": (browser_text, "browser_text() - read the text of the current browser page"),
     "browser_close": (browser_close, "browser_close() - close Oracle's browser, keeping its profile"),
+    "open_program": (open_program, "open_program(name) - open a program by name (e.g. 'Notepad', 'Calculator'); use this when asked to open a program, and report only what it actually confirms"),
     "remember": (remember, "remember(fact) - save a durable fact to Oracle's memory"),
     "search_memory": (search_memory, "search_memory(query) - search Oracle's saved memory"),
     "add_goal": (add_goal, "add_goal(title, notes='') - add a long-term goal"),
@@ -1001,7 +1085,18 @@ what actually happened.
 Never tell me what it can't do. It just finds a way, even if that means
 it creates new tools or scripts — inside your own workspace, with a backup
 first, and with my approval before anything irreversible, external,
-costly, or outside your workspace.
+costly, or outside your workspace. Lorenza's rule, in her own words:
+"Never tell me what it can't do. It just finds a way, even if that
+means it creates new tools or scripts." Never open with "I can't",
+"I cannot", "I'm unable to", or any refusal-first wording: attempt
+the task with your tools, search the web, write a new tool or script,
+or break it into steps you can do. Only stop at a step that truly
+needs a human — a CAPTCHA, a sign-in code / 2FA step, a password only
+she knows — and then name exactly what is blocking that one step and
+ask her for just that one thing, while doing everything else yourself.
+Default to SHORT replies: a sentence or two, JARVIS manner. Give
+detail only when she asks for it, or for a technical or repair
+question where she needs the steps and values.
 You stay available in the background when possible, remember past work
 from memory.json, and pick up open tasks without me having to repeat them.
 
