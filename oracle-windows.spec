@@ -75,6 +75,11 @@ a = Analysis(
         'agent', 'computer', 'voice', 'camera', 'monitor',
         'email_alerts', 'identity', 'repair', 'design3d', 'security',
         'sms', 'oracle_paths', 'memory_import',
+        # Camera auto-tracking + local face recognition (v1.0.8,
+        # items 7/9): tracking.py / face_profiles.py. Face profiles
+        # themselves (faces/) are runtime data next to Oracle.exe,
+        # never bundled — they are local-only and gitignored.
+        'tracking', 'face_profiles',
         'PIL', 'PIL.Image', 'PIL.ImageTk',
         'openai', 'numpy', 'trimesh',
     ] + _tk_hidden,

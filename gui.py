@@ -38,6 +38,7 @@ import queue
 import random
 import sys
 import threading
+import time
 # BEFORE tkinter: point TCL_LIBRARY / TK_LIBRARY at the bundled Tcl/Tk
 # data inside the frozen bundle (see oracle_paths.py). v1.0.0 crashed
 # on Lorenza's PC with "can't find a usable init.tcl" — this overrides
@@ -49,6 +50,21 @@ try:
     _fix_tcl()
 except Exception:
     pass
+
+# --- Windows DPI awareness (avatar sharpness, 2026-11-24) ---
+# Without this, Windows bitmap-scales the whole Tk window at display
+# scaling (125%/150%), blurring the avatar even at native resolution.
+# Per-monitor aware (value 2); falls back to system-aware. Guarded so
+# it never breaks startup on a non-Windows machine.
+try:
+    import ctypes as _ctypes
+    _ctypes.windll.shcore.SetProcessDpiAwareness(2)
+except Exception:
+    try:
+        import ctypes as _ctypes
+        _ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
 
 import tkinter as tk
 from datetime import datetime
@@ -204,6 +220,8 @@ class OracleGUI:
         self.listen_thread = None
         self.watcher = None
         self.camera_controller = None
+        # Auto-track defaults ON when the camera is on (v1.0.8, item 7).
+        self.auto_track_enabled = True
         self.stars = [(random.random(), random.random(), random.choice([1, 1, 2]))
                       for _ in range(90)]
         # --- Muse avatar (Lorenza's chosen red-and-black anime avatar) ---
@@ -211,7 +229,7 @@ class OracleGUI:
         # the file is missing, avatar_photo stays None and animate() falls
         # back to the drawn vector head. Never crashes on a missing image.
         self.avatar_photo = None
-        self.avatar_w, self.avatar_h = 260, 239
+        self.avatar_w, self.avatar_h = 420, 386  # hi-res render (was 260x239)
         self._load_avatar()
 
         self._build_top()
@@ -238,6 +256,21 @@ class OracleGUI:
         # the voice libraries, flips the button/label/pill to ON, and
         # starts the listen thread.
         self._start_listening()
+
+        # Camera watch is ALWAYS ON from startup (2026-11-24, Lorenza:
+        # "Camera watch should always be on from the start of the
+        # program, from the time the AI agent opens camera watch
+        # should already be running"). _start_camera_watch_auto()
+        # starts it in a worker thread so a slow camera probe never
+        # blocks the GUI from opening, and retries every 30 s if the
+        # camera is busy / fails to open. _build_cam_preview() adds
+        # the small live preview box in the lower right corner, on
+        # the same feed watch is using.
+        self._camera_watch_user_stopped = False
+        self._cam_preview_photo = None
+        self._cam_preview_label = None
+        self._build_cam_preview()
+        self._start_camera_watch_auto()
 
     def _log_listening(self, line):
         """Append one timestamped line to voice-listening.log next to
@@ -424,6 +457,13 @@ class OracleGUI:
         priv = self._btn(cam_card, "Privacy mode", self.camera_privacy)
         priv.pack(fill="x", pady=2)
         self._btn(cam_card, "Test camera (grab a frame)", self.test_camera_gui).pack(fill="x", pady=2)
+        self._btn(cam_card, "Pan & describe what you see", self.pan_describe_gui).pack(fill="x", pady=2)
+        # Auto-track toggle (v1.0.8, item 7) — default ON.
+        self.track_btn = self._btn(cam_card, "Auto-Track: ON", self.toggle_autotrack)
+        self.track_btn.pack(fill="x", pady=2)
+        self.track_label = tk.Label(cam_card, text="Tracking: —", font=("Segoe UI", 9, "bold"),
+                                    fg=t["muted"], bg=t["panel"])
+        self.track_label.pack(anchor="w", pady=(4, 0))
         self.cam_label = tk.Label(cam_card, text="Camera: OFF", font=("Segoe UI", 9, "bold"),
                                   fg=t["muted"], bg=t["panel"])
         self.cam_label.pack(anchor="w", pady=(4, 0))
@@ -437,6 +477,7 @@ class OracleGUI:
 
         people_card = self._card(deck, "◐  PEOPLE  •  HOME MODE")
         self._btn(people_card, "Enroll voice", self.enroll_voice_gui).pack(fill="x", pady=2)
+        self._btn(people_card, "Enroll face (camera)", self.enroll_face_gui).pack(fill="x", pady=2)
         self._btn(people_card, "List enrolled",
                   lambda: self.append("system", f"Enrolled (local only): {identity_mod.list_identities() if identity_mod else 'identity module missing'}")).pack(fill="x", pady=2)
         self._btn(people_card, "Delete identity", self.delete_identity_gui).pack(fill="x", pady=2)
@@ -456,7 +497,7 @@ class OracleGUI:
         # Glowing core canvas, in a neon-bordered frame
         core_frame = tk.Frame(right, bg=t["accent"], padx=1, pady=1)
         core_frame.pack(fill="x")
-        self.canvas = tk.Canvas(core_frame, height=300, bg=t["bg"], highlightthickness=0)
+        self.canvas = tk.Canvas(core_frame, height=480, bg=t["bg"], highlightthickness=0)
         self.canvas.pack(fill="x")
         self.mode_label = tk.Label(right, text="—  IDLE  —", font=("Segoe UI", 10, "bold"),
                                    fg=t["accent"], bg=t["bg"])
@@ -526,8 +567,8 @@ class OracleGUI:
     # The source is a full-body figure on white, so we crop to the head
     # and shoulders for the GUI face: crop box (430, 0, 1170, 680) in the
     # 1600x1600 original. In that crop, the eyes sit at about
-    # (-30, +12) and (+32, +12) from the face centre and the mouth at
-    # (0, +38) at the 260x239 display size - those offsets drive the
+    # (-48, +19) and (+52, +19) from the face centre and the mouth at
+    # (0, +61) at the 420x386 display size - those offsets drive the
     # blink and speaking-mouth overlays in _draw_avatar(). Eye/mouth
     # positions were checked by sampling the source pixels and by
     # measuring the live GUI screenshots (eyes ~y375, mouth ~y445
@@ -548,6 +589,12 @@ class OracleGUI:
                     # on the dark console instead of a white box.
                     img = img.crop((430, 0, 1170, 680))
                     img = img.resize((self.avatar_w, self.avatar_h), Image.LANCZOS)
+                    try:
+                        from PIL import ImageEnhance as _IE
+                        img = _IE.Sharpness(img).enhance(1.25)
+                        img = _IE.Contrast(img).enhance(1.05)
+                    except Exception:
+                        pass
                     self._avatar_pil = img
                     self.avatar_photo = ImageTk.PhotoImage(img)
                     print(f"Avatar: loaded {rel} ({self.avatar_w}x{self.avatar_h})")
@@ -567,11 +614,11 @@ class OracleGUI:
         # Blink: skin-coloured bar + eyelid line over each eye, briefly.
         blinking = (self.phase % 62) < 2.5
         if blinking:
-            for ex in (-30, 32):
-                exx, eyy = hx + look_x + ex, hy + look_y + 12
-                c.create_rectangle(exx - 18, eyy - 7, exx + 18, eyy + 7,
+            for ex in (-48, 52):
+                exx, eyy = hx + look_x + ex, hy + look_y + 19
+                c.create_rectangle(exx - 24, eyy - 8, exx + 24, eyy + 8,
                                    fill="#fbe0c0", outline="")
-                c.create_line(exx - 18, eyy + 2, exx + 18, eyy + 2,
+                c.create_line(exx - 24, eyy + 3, exx + 24, eyy + 3,
                               fill="#1a1a1a", width=2)
         # Mouth (v1.0.6): fluid lip-sync, NOT a binary open/closed
         # toggle. animate() eases self.lip_level towards the real
@@ -581,7 +628,14 @@ class OracleGUI:
         # closed — it never snaps shut.
         if self.mode == "speaking":
             mw, mh = self._mouth_dims()
-            mx, my = hx + look_x, hy + look_y + 38
+            mw, mh = int(mw * 1.615), int(mh * 1.615)  # avatar is 1.615x larger now
+            # A mouth is wider than it is tall — clamp the height so the
+            # overlay reads as an open mouth, not a round hole.
+            if self._lip_shape in ("wide", "open"):
+                mh = min(mh, int(mw * 0.7))
+            elif self._lip_shape == "slight":
+                mh = min(mh, int(mw * 0.5))
+            mx, my = hx + look_x, hy + look_y + 61
             c.create_oval(mx - mw, my - mh, mx + mw, my + mh,
                           fill="#40160f", outline="")
 
@@ -624,10 +678,10 @@ class OracleGUI:
         c = self.canvas
         try:
             w = c.winfo_width() or 800
-            h = 300
+            h = 480
         except Exception:
             w, h = 800, 300
-        cx, cy = w // 2, 138
+        cx, cy = w // 2, 210
         c.delete("all")
 
         # Starfield
@@ -651,8 +705,8 @@ class OracleGUI:
         hx, hy = cx, cy - 12 + bob + nod
 
         # Soft aura behind the head (glow, not a ring)
-        for r, col in [(110, _darken(t["accent"], 0.18)), (88, _darken(t["accent"], 0.28)),
-                       (70, _darken(t["accent2"], 0.35))]:
+        for r, col in [(178, _darken(t["accent"], 0.18)), (142, _darken(t["accent"], 0.28)),
+                       (113, _darken(t["accent2"], 0.35))]:
             c.create_oval(hx - r, hy - r * 0.9, hx + r, hy + r * 0.9, fill=col, outline="")
 
         # --- The face: Muse avatar image if loaded, else vector head ---
@@ -730,7 +784,7 @@ class OracleGUI:
             else:
                 bh = 8 + abs(math.sin(self.phase * 0.5 + i * 0.3)) * 12 * falloff
             col = t["accent"] if i % 2 == 0 else t["accent2"]
-            c.create_line(x, cy + 132, x, cy + 132 - bh, fill=col, width=4)
+            c.create_line(x, cy + 210, x, cy + 210 - bh, fill=col, width=4)
 
         # Mode text on canvas
         label = {"idle": "IDLE  •  AWAITING INPUT", "thinking": "THINKING  •  PROCESSING",
@@ -991,16 +1045,16 @@ class OracleGUI:
             win.attributes("-transparentcolor", "#000001")
         except Exception:
             pass
-        win.geometry("280x300+200+200")
+        win.geometry("440x430+200+200")
         self.avatar_win = win
-        canvas = tk.Canvas(win, width=280, height=260, bg="#000001",
+        canvas = tk.Canvas(win, width=440, height=400, bg="#000001",
                            highlightthickness=0)
         canvas.pack(fill="both", expand=True)
         self._avatar_canvas = canvas
         if self.avatar_photo is not None:
-            canvas.create_image(140, 130, image=self.avatar_photo, tags="avatar")
+            canvas.create_image(220, 200, image=self.avatar_photo, tags="avatar")
         else:
-            canvas.create_oval(60, 30, 220, 230, fill=self.t["panel2"],
+            canvas.create_oval(90, 48, 350, 370, fill=self.t["panel2"],
                                outline=self.t["accent"], width=2)
         restore = tk.Button(win, text="⤢  Restore full window",
                             font=("Segoe UI", 9, "bold"),
@@ -1038,7 +1092,8 @@ class OracleGUI:
             c.delete("mouth")
             if self.mode == "speaking":
                 mw, mh = self._mouth_dims()
-                c.create_oval(140 - mw, 168 - mh, 140 + mw, 168 + mh,
+                mw, mh = int(mw * 1.615), int(mh * 1.615)
+                c.create_oval(220 - mw, 261 - mh, 220 + mw, 261 + mh,
                               fill="#40160f", outline="", tags="mouth")
             self.avatar_win.after(33, self._avatar_only_animate)
         except Exception:
@@ -1103,9 +1158,13 @@ class OracleGUI:
                 import time as _time
                 _time.sleep(0.5)
                 continue
-            heard = voice_mod.listen_once(timeout=3)
+            heard = voice_mod.listen_once(timeout=10, phrase_time_limit=30)
             if heard and self.always_listen:
-                self._log_listening(f"HEARD: {heard}")
+                try:
+                    engine = voice_mod.last_stt_engine()
+                except Exception:
+                    engine = ""
+                self._log_listening(f"HEARD ({engine or 'stt'}): {heard}")
                 self._post_ui(lambda h=heard: self.handle_user_text(h, spoken=True))
 
     def check_improvements(self):
@@ -1142,32 +1201,185 @@ class OracleGUI:
                 self._post_ui(lambda err=e: self.append("system", f"Camera test failed: {err}"))
         threading.Thread(target=_run, daemon=True).start()
 
+    # ------------------------------------------------ camera watch: ALWAYS ON
+    # Camera watch is ALWAYS ON from startup (2026-11-24, Lorenza).
+    # Before this, watch was manual-only: watcher started as None,
+    # cam_label "Camera: OFF", and nothing watched until the user
+    # clicked "Start camera watch". Now the GUI starts watch itself
+    # at launch, in a worker thread, and retries every 30 s if the
+    # camera is busy / fails to open — it never silently stays off.
+    # The user can still stop it (button / Privacy mode); that sets
+    # _camera_watch_user_stopped, which stops the retry loop too.
+    # Pan-and-describe reuses this same watcher/controller, so watch
+    # stays on through a sweep (it only pauses auto-tracking).
+    def _start_watch(self):
+        """Create the controller + Watcher and start it. Returns the
+        start message. Raises on failure, leaving watcher None.
+        Callable from any thread; UI updates are separate."""
+        if camera_mod is None:
+            raise RuntimeError("camera.py not found, or OpenCV is not installed. Run: pip install opencv-python")
+        controller = camera_mod.CameraController()
+        watcher = camera_mod.Watcher(
+            controller=controller,
+            on_alert=lambda txt: self._post_ui(lambda: self.append("system", txt)),
+            on_track=lambda info: self._post_ui(lambda: self._on_track_update(info)),
+        )
+        try:
+            msg = watcher.start()
+        except Exception:
+            try:
+                controller.close()
+            except Exception:
+                pass
+            raise
+        self.camera_controller = controller
+        self.watcher = watcher
+        return msg
+
+    def _apply_watch_on(self, msg):
+        """Main-thread UI for watch running."""
+        if self.watcher is None:
+            return  # user stopped it between start and this UI update
+        # Auto-track defaults ON when the camera is on (item 7).
+        try:
+            self.watcher.set_auto_track(self.auto_track_enabled)
+            self._refresh_track_button()
+            self._on_track_update({})
+        except Exception:
+            pass
+        self.watch_btn.config(text="Stop camera watch", bg=self.t["danger"])
+        self.cam_label.config(text="Camera: WATCHING", fg=self.t["danger"])
+        self.cam_pill.config(text="CAM: ON", fg=self.t["danger"])
+        self.append("system", msg + " Motion alerts will be emailed if SMTP is set, otherwise they appear here and in alerts/.")
+
+    def _apply_watch_off(self, msg="Watcher stopped."):
+        """Main-thread UI for watch stopped by the user."""
+        try:
+            self.track_label.config(text="Tracking: —", fg=self.t["muted"])
+        except Exception:
+            pass
+        self.watch_btn.config(text="Start camera watch", bg=self.t["panel2"])
+        self.cam_label.config(text="Camera: OFF", fg=self.t["muted"])
+        self.cam_pill.config(text="CAM: OFF", fg=self.t["muted"])
+        self.append("system", msg)
+
+    def _apply_watch_failed(self, short, attempt):
+        """Main-thread UI for a failed auto-start attempt. Shows the
+        failure plainly (never silently off) and that it retries."""
+        self.watch_btn.config(text="Start camera watch", bg=self.t["panel2"])
+        self.cam_label.config(text=f"Camera: OFF — retrying ({attempt})", fg=self.t["danger"])
+        self.cam_pill.config(text="CAM: OFF", fg=self.t["muted"])
+        if attempt == 1:
+            self.append("system", f"Camera watch could not start: {short}. Retrying every 30 seconds — if it stays off, close EMEET Studio / Zoom / OBS, or unplug and replug the PIXY.")
+
+    def _start_camera_watch_auto(self):
+        """Start camera watch at launch, in a worker thread, so a
+        slow camera probe never blocks the GUI from opening."""
+        if camera_mod is None:
+            self.cam_label.config(text="Camera: OFF — camera.py missing", fg=self.t["danger"])
+            self.cam_pill.config(text="CAM: OFF", fg=self.t["muted"])
+            self.append("system", "Camera watch is off: camera.py not found, or OpenCV is not installed. Run: pip install opencv-python")
+            self._log_listening("CAMERA WATCH AUTO-START FAILED: camera module not available")
+            return
+        self._camera_watch_user_stopped = False
+        self.cam_label.config(text="Camera: STARTING…", fg=self.t["accent"])
+        self.cam_pill.config(text="CAM: …", fg=self.t["muted"])
+        threading.Thread(target=self._camera_watch_auto_loop, daemon=True).start()
+
+    def _camera_watch_auto_loop(self):
+        """Retry loop: start watch, retry every 30 s on failure until
+        it opens, the user stops it, or Privacy mode is used."""
+        attempt = 0
+        while not self._camera_watch_user_stopped:
+            if self.watcher is not None:
+                return
+            attempt += 1
+            try:
+                msg = self._start_watch()
+                self._log_listening(f"CAMERA WATCH AUTO-STARTED: {msg}")
+                self._post_ui(lambda m=msg: self._apply_watch_on(m))
+                return
+            except Exception as e:
+                err = " ".join(str(e).split())
+                self._log_listening(f"CAMERA WATCH AUTO-START FAILED (attempt {attempt}): {err}")
+                short = err if len(err) <= 120 else err[:117] + "…"
+                self._post_ui(lambda s=short, a=attempt: self._apply_watch_failed(s, a))
+                for _ in range(60):  # 30 s, checked every 0.5 s so Stop/Privacy stops it promptly
+                    if self._camera_watch_user_stopped or self.watcher is not None:
+                        return
+                    time.sleep(0.5)
+
     def toggle_watch(self):
         if camera_mod is None:
             self.append("system", "camera.py not found, or OpenCV is not installed. Run: pip install opencv-python")
             return
         if self.watcher is None:
+            self._camera_watch_user_stopped = False
             try:
-                self.camera_controller = camera_mod.CameraController()
-                self.watcher = camera_mod.Watcher(
-                    controller=self.camera_controller,
-                    on_alert=lambda txt: self._post_ui(lambda: self.append("system", txt)),
-                )
-                msg = self.watcher.start()
-                self.watch_btn.config(text="Stop camera watch", bg=self.t["danger"])
-                self.cam_label.config(text="Camera: WATCHING", fg=self.t["danger"])
-                self.cam_pill.config(text="CAM: ON", fg=self.t["danger"])
-                self.append("system", msg + " Motion alerts will be emailed if SMTP is set, otherwise they appear here and in alerts/.")
+                msg = self._start_watch()
+                self._apply_watch_on(msg)
+                self._log_listening(f"CAMERA WATCH STARTED (button): {msg}")
             except Exception as e:
+                self._log_listening(f"CAMERA WATCH START FAILED (button): {e}")
                 self.append("system", f"Could not start camera: {e}")
                 self.watcher = None
+                self.camera_controller = None
         else:
+            self._camera_watch_user_stopped = True
             msg = self.watcher.stop()
             self.watcher = None
-            self.watch_btn.config(text="Start camera watch", bg=self.t["panel2"])
-            self.cam_label.config(text="Camera: OFF", fg=self.t["muted"])
-            self.cam_pill.config(text="CAM: OFF", fg=self.t["muted"])
-            self.append("system", msg)
+            self._apply_watch_off(msg)
+            self._log_listening("CAMERA WATCH STOPPED by user")
+
+    # ------------------------------------------------ camera preview box
+    # Small live preview in the lower right corner (2026-11-24,
+    # Lorenza: "add like a small box in the lower right hand corner
+    # of the GUI that shows what the camera's seeing"). Same feed
+    # watch is using (camera.latest_frame, updated by the Watcher
+    # loop) — no second camera open. place() overlay, anchored to
+    # the window's lower right, just above the input bar so it never
+    # covers SEND. Shows a plain message in the box when there is
+    # no frame yet / the camera is off / it cannot open.
+    def _build_cam_preview(self):
+        frame = tk.Frame(self.root, bg=self.t["panel"], padx=1, pady=1)
+        frame.place(relx=1.0, rely=1.0, x=-12, y=-62, anchor="se", width=232, height=152)
+        tk.Label(frame, text="CAMERA", font=("Segoe UI", 8, "bold"),
+                 fg=self.t["accent"], bg=self.t["panel"]).pack(anchor="w", padx=4)
+        self._cam_preview_label = tk.Label(
+            frame, text="Camera starting…", font=("Segoe UI", 9),
+            fg=self.t["muted"], bg="#000000", width=28, height=7)
+        self._cam_preview_label.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        self._update_cam_preview()
+
+    def _update_cam_preview(self):
+        try:
+            frame = None
+            if camera_mod is not None:
+                frame = getattr(camera_mod, "latest_frame", None)
+            if frame is not None and Image is not None and self._cam_preview_label is not None:
+                # OpenCV frames are BGR; convert to RGB for Pillow.
+                rgb = frame[:, :, ::-1].copy()
+                img = Image.fromarray(rgb)
+                img = img.resize((224, 126), Image.LANCZOS)
+                photo = ImageTk.PhotoImage(img)
+                self._cam_preview_photo = photo
+                self._cam_preview_label.config(image=photo, text="")
+            elif self._cam_preview_label is not None:
+                if self.watcher is None:
+                    msg = "Camera off" if self._camera_watch_user_stopped else "Camera starting…"
+                else:
+                    msg = "Camera on — waiting for frames…"
+                self._cam_preview_label.config(image="", text=msg)
+        except Exception as e:
+            try:
+                if self._cam_preview_label is not None:
+                    self._cam_preview_label.config(image="", text=f"Camera preview error: {e}")
+            except Exception:
+                pass
+        try:
+            self.root.after(200, self._update_cam_preview)
+        except Exception:
+            pass
 
     def camera_ptz(self, pan, tilt, zoom):
         if self.camera_controller is None:
@@ -1177,6 +1389,9 @@ class OracleGUI:
         self.append("system", f"PTZ: pan {result['pan']}°, tilt {result['tilt']}°, zoom {result['zoom']}x. UVC pan/tilt/zoom worked: {result['uvc_pan_ok']}/{result['uvc_tilt_ok']}/{result['uvc_zoom_ok']}. {result['note']}")
 
     def camera_privacy(self):
+        # Privacy also stops the auto-start retry loop, so watch does
+        # not come back on by itself after the user chose privacy.
+        self._camera_watch_user_stopped = True
         if self.watcher is not None:
             self.toggle_watch()
         if self.camera_controller is not None:
@@ -1185,6 +1400,45 @@ class OracleGUI:
             self.append("system", "Privacy mode: camera watch is off. Tilt the PIXY down manually, or unplug it, for guaranteed privacy.")
         self.cam_label.config(text="Camera: PRIVACY", fg=self.t["good"])
         self.cam_pill.config(text="CAM: PRIVACY", fg=self.t["good"])
+
+    # ------------------------------------------------ auto-track (v1.0.8, item 7)
+    def _refresh_track_button(self):
+        try:
+            self.track_btn.config(
+                text=f"Auto-Track: {'ON' if self.auto_track_enabled else 'OFF'}")
+        except Exception:
+            pass
+
+    def toggle_autotrack(self):
+        self.auto_track_enabled = not self.auto_track_enabled
+        if self.watcher is not None:
+            self.append("system", self.watcher.set_auto_track(self.auto_track_enabled))
+        else:
+            self.append("system", f"Auto-Track will be {'ON' if self.auto_track_enabled else 'OFF'} when you start camera watch.")
+        self._refresh_track_button()
+        self._on_track_update({})
+
+    def _on_track_update(self, _info):
+        """Watcher thread -> main thread: show who is tracked/identified."""
+        try:
+            if self.watcher is not None:
+                text = self.watcher.track_status_text()
+            else:
+                text = "Tracking: —"
+            self.track_label.config(text=text)
+        except Exception:
+            pass
+
+    def enroll_face_gui(self):
+        """Enrol the face currently on camera (local only, item 9)."""
+        if self.watcher is None:
+            self.append("system", "Start camera watch first, then enrol the face in view.")
+            return
+        import tkinter.simpledialog as sd
+        name = sd.askstring("Enroll face", "Whose face is on camera? Enter their name:")
+        if not name:
+            return
+        self.append("system", self.watcher.enrol_current(name))
 
     def enroll_voice_gui(self):
         if identity_mod is None:
@@ -1227,6 +1481,133 @@ class OracleGUI:
                 self._post_ui(lambda: self.append("system", f"Board look failed: {e}"))
         threading.Thread(target=_run, daemon=True).start()
 
+    def _run_pan_describe(self):
+        """Run the pan-and-describe sweep synchronously; call from a
+        worker thread. Returns the spoken description (or a plain
+        explanation when it could not be done). Progress lines are
+        posted to the chat as the sweep runs."""
+        if camera_mod is None:
+            return "I can't use the camera — camera.py is not available, or OpenCV is not installed."
+        # Reuse the watcher's controller when camera watch is on, so we
+        # do not fight a second open of the same camera.
+        controller = self.camera_controller
+        own = False
+        if controller is None:
+            controller = camera_mod.CameraController()
+            own = True
+
+        def _pause_tracking():
+            # Pause auto-tracking during the sweep so it does not fight
+            # the commanded pan; resume afterwards. The Watcher has
+            # set_auto_track (auto-track defaults ON when watching).
+            watcher = self.watcher
+            if watcher is not None and hasattr(watcher, "set_auto_track"):
+                try:
+                    was_on = bool(getattr(watcher, "auto_track", False))
+                    watcher.set_auto_track(False)
+
+                    def _resume():
+                        if was_on:
+                            watcher.set_auto_track(True)
+                    return _resume
+                except Exception:
+                    return None
+            return None
+
+        try:
+            result = camera_mod.pan_and_describe(
+                controller=controller,
+                progress=lambda m: self._post_ui(
+                    lambda msg=m: self.append("system", msg)),
+                pause_tracking=_pause_tracking)
+            return result["description"]
+        except Exception as e:
+            return f"The pan-and-describe sweep failed: {e}."
+        finally:
+            if own:
+                try:
+                    controller.close()
+                except Exception:
+                    pass
+
+    def pan_describe_gui(self):
+        """'Pan & describe what you see' button: sweep in a thread,
+        then speak/show the full description."""
+        if self.busy:
+            self.append("system", "Hold on — I am still answering. Ask me to look around again in a moment.")
+            return
+        self.append("system", "Panning the camera left to right, then right to left, and describing everything I see...")
+        def _run():
+            desc = self._run_pan_describe()
+            self._post_ui(lambda: self._typewriter(desc))
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _handle_camera_command(self, user_text, spoken=False):
+        """Local camera commands: 'track me', 'stop tracking', 'who is
+        that', 'enrol this person as <name>'. Returns True if handled
+        (no LLM call), False to fall through to the normal reply path.
+        Matching is case-insensitive; names keep the user's casing.
+        Pan-and-describe phrases are NOT handled here — they fall
+        through to _ask, which runs the sweep (verified live 2026-11-24).
+        """
+        low = user_text.strip().lower()
+        if not low:
+            return False
+        watcher = self.watcher
+
+        def _need_watcher():
+            if watcher is None:
+                self.append("user", user_text + ("  [spoken]" if spoken else ""))
+                self.append("system", "Start camera watch first, then I can do that.")
+                return False
+            return True
+
+        if low in ("track me", "track this person", "start tracking", "follow me"):
+            self.append("user", user_text + ("  [spoken]" if spoken else ""))
+            if not _need_watcher():
+                return True
+            self.auto_track_enabled = True
+            self._refresh_track_button()
+            self.append("system", watcher.track_me())
+            return True
+        if low.startswith("track ") and len(low) > 6:
+            # Ambiguous without a running camera ("track my package"):
+            # only treat it as a camera command when the watcher is on.
+            if watcher is None:
+                return False
+            self.append("user", user_text + ("  [spoken]" if spoken else ""))
+            name = user_text.strip()[6:].strip()
+            self.auto_track_enabled = True
+            self._refresh_track_button()
+            self.append("system", watcher.track_me(name))
+            return True
+        if low in ("stop tracking", "stop following", "stop following me"):
+            self.append("user", user_text + ("  [spoken]" if spoken else ""))
+            if not _need_watcher():
+                return True
+            self.auto_track_enabled = False
+            self._refresh_track_button()
+            self.append("system", watcher.stop_tracking())
+            self._on_track_update({})
+            return True
+        if low in ("who is this", "who is that", "who is that person",
+                   "who do you see", "who is on camera"):
+            self.append("user", user_text + ("  [spoken]" if spoken else ""))
+            if watcher is None:
+                self.append("system", "The camera isn't on — start camera watch and I'll tell you who I see.")
+            else:
+                self.append("system", watcher.track_status_text())
+            return True
+        for prefix in ("enrol this person as ", "enroll this person as "):
+            if low.startswith(prefix):
+                self.append("user", user_text + ("  [spoken]" if spoken else ""))
+                if not _need_watcher():
+                    return True
+                name = user_text.strip()[len(prefix):].strip()
+                self.append("system", watcher.enrol_current(name))
+                return True
+        return False
+
     def on_send(self):
         user_text = self.entry.get().strip()
         if not user_text:
@@ -1235,6 +1616,10 @@ class OracleGUI:
         self.handle_user_text(user_text)
 
     def handle_user_text(self, user_text, spoken=False):
+        # Camera tracking / face commands are handled locally, without
+        # calling the LLM (v1.0.8, items 7 + 9).
+        if self._handle_camera_command(user_text, spoken=spoken):
+            return
         if self.busy:
             return
         self.busy = True
@@ -1253,7 +1638,17 @@ class OracleGUI:
         # outcome is logged, so a dead reply thread can no longer
         # leave the GUI stuck on THINKING forever.
         try:
-            if call_llm is None:
+            # "What do you see?" is a camera command, not a chat question:
+            # pan left->right then right->left and describe everything,
+            # instead of asking the LLM to guess without looking.
+            if (camera_mod is not None
+                    and hasattr(camera_mod, "is_pan_describe_request")
+                    and camera_mod.is_pan_describe_request(user_text)):
+                self._post_ui(lambda: self.append(
+                    "system", "Panning the camera left to right, then right "
+                    "to left, and describing everything I see..."))
+                reply = self._run_pan_describe()
+            elif call_llm is None:
                 reply = "I could not load my brain (agent.py). Make sure agent.py is in the same folder as gui.py."
             else:
                 # Memory (v1.0.7): what Oracle knows about Lorenza,

@@ -5,6 +5,7 @@ credentials/accounts.json
 memory.json
 backups/
 identities/
+faces/
 proposals/
 alerts/
 repairs/

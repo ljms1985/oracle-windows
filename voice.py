@@ -21,8 +21,16 @@ Fallbacks, in order - speak() never raises into the GUI thread:
      moves even though there is no real audio to measure.
   3. If that also fails, print a clear error and return.
 
-Listening is unchanged: Google Speech Recognition, no wake word
-(see listen_once() below).
+Listening (v1.0.7 STT fix, 2026-11-24): OpenAI Whisper API
+("whisper-1") is the primary transcriber — the same class of model
+Muse uses, with a context prompt so it gets Lorenza's names and
+topics right. Google Speech Recognition is only a fallback if
+Whisper fails / no key. The microphone is picked explicitly
+(EMEET PIXY first — Lorenza speaks to that camera mic — never the
+Windows Sound Mapper default, which was picking the wrong input),
+and ambient-noise calibration happens ONCE per session, not on
+every phrase (the old code re-calibrated for 0.5s on every call and
+clipped the start of sentences). No wake word (see listen_once()).
 
 Install on Windows:
   pip install pyttsx3 SpeechRecognition PyAudio
@@ -37,10 +45,14 @@ IMPORTANT - always listening, read this:
     toggle is ON, the microphone is active and speech is transcribed.
     Anyone nearby, a TV, or a podcast can trigger it. That is the
     trade-off of having NO wake word.
-  * Transcription in this starter uses Google Speech Recognition over
-    the internet by default (SpeechRecognition's recognize_google).
-    That means audio snippets go to Google. If you do not want that,
-    swap in an offline engine like Vosk - see the TODO in listen_once().
+  * Transcription uses the OpenAI Whisper API by default (audio
+    snippets go to OpenAI, same as the TTS/reply calls — key from
+    OPENAI_API_KEY, never printed/logged/stored). If Whisper is
+    unavailable it falls back to Google Speech Recognition, and if
+    neither works it returns "" and the GUI keeps listening.
+    A local faster-whisper model was considered and NOT used as the
+    default: it needs a ~2 GB torch install the PC does not have,
+    and the Whisper API tested more accurate on real speech.
   * There is ALWAYS a visible LISTENING indicator in the GUI, and a
     button to pause listening instantly. Never run this hidden.
   * This is for YOUR own PC, in YOUR own home, by your choice. Do not
@@ -63,6 +75,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 import wave
 
 # ---------------------------------------------------------------- config
@@ -551,35 +564,268 @@ def speak_async(text, on_level=None, on_done=None):
     return thread
 
 
-def listen_once(timeout=5, phrase_time_limit=12):
+# ---------------------------------------------------------------- speech-to-text
+# Primary: OpenAI Whisper API (whisper-1). Fallback: Google web speech.
+# Why Whisper, and why the old code misheard (diagnosed 2026-11-24 from
+# C:\friend-agent\voice-listening.log — fragments like "who do you
+# think you will build by", "better is good progress will keep those",
+# "I built you"):
+#   1. The old code used SpeechRecognition's recognize_google — a free,
+#      no-context web recognizer. It has no language model for Lorenza's
+#      words/names, so it guesses wrong on normal sentences.
+#   2. It used sr.Microphone() with no device — the Windows Sound Mapper
+#      default. On Lorenza's PC that is NOT the mic she speaks into:
+#      the EMEET PIXY camera mic (index 1) is the one in front of her.
+#      The wrong input = quiet / distant / wrong-channel audio.
+#   3. It re-ran adjust_for_ambient_noise(0.5s) on EVERY phrase, so the
+#      first half-second of every sentence was spent calibrating, and
+#      the GUI loop called listen_once(timeout=3), so it kept giving up
+#      after 3s of silence and starting over.
+# Fix: Whisper + context prompt, explicit EMEET mic, calibrate once,
+# longer listen window, pause_threshold so natural pauses don't cut
+# a sentence in half.
+
+OPENAI_WHISPER_URL = "https://api.openai.com/v1/audio/transcriptions"
+OPENAI_WHISPER_MODEL = "whisper-1"
+_WHISPER_PROMPT = (
+    "Lorenza, Oracle, Dodge Challenger, Hyundai Sonata, Jacksonville, "
+    "electronics, PCB repair, Challenger, Sonata"
+)
+# NOTE: keep the prompt a short list of names/topics, NOT a full
+# sentence — Whisper can echo a sentence-style prompt back as a
+# hallucination on quiet/noisy audio. (Seen live 2026-11-24: it
+# returned the old prompt's last sentence on a silent segment.)
+
+# Last engine that produced a transcription ("whisper", "google", "").
+_last_stt_engine = ""
+_stt_lock = threading.Lock()
+_listener_state = {"recognizer": None, "mic_index": None, "mic_name": "",
+                   "calibrated": False}
+
+
+def last_stt_engine():
+    """Engine that produced the most recent transcription."""
+    with _stt_lock:
+        return _last_stt_engine
+
+
+def _set_last_engine(name):
+    global _last_stt_engine
+    with _stt_lock:
+        _last_stt_engine = name
+
+
+def _pick_microphone_index():
+    """Best mic for Lorenza: EMEET PIXY first, else the system default.
+
+    Returns (device_index_or_None, display_name). The EMEET PIXY is
+    the camera in front of her; the Sound Mapper default was picking
+    the wrong input on her PC (see mic list 2026-11-24: EMEET PIXY at
+    index 1, plus Steam/Realtek/AudioBox inputs that are not her mic).
     """
-    Listen once from the default microphone and return transcribed text,
-    or "" if nothing was heard or transcription failed.
-    No wake word is checked - any intelligible speech is returned.
+    try:
+        import speech_recognition as sr
+        names = sr.Microphone.list_microphone_names()
+    except Exception:
+        return None, ""
+    for i, name in enumerate(names or []):
+        if "EMEET" in (name or "").upper():
+            return i, name
+    return None, (names[0] if names else "")
+
+
+def _get_listener():
+    """Cached recognizer + mic, calibrated ONCE per session.
+
+    Returns (recognizer, mic_index, mic_name) or (None, None, "") if
+    SpeechRecognition / PyAudio is missing. Calibration runs once
+    (1.0s ambient) — never per phrase — so the start of a sentence
+    is never eaten by re-calibration.
     """
+    st = _listener_state
+    if st["recognizer"] is not None:
+        return st["recognizer"], st["mic_index"], st["mic_name"]
     try:
         import speech_recognition as sr
     except ImportError:
         print("[voice] SpeechRecognition not installed. pip install SpeechRecognition PyAudio")
-        return ""
+        return None, None, ""
     r = sr.Recognizer()
-    r.energy_threshold = 300
+    r.energy_threshold = 400
     r.dynamic_energy_threshold = True
+    r.pause_threshold = 0.8          # natural pause inside a sentence: keep listening
+    r.non_speaking_duration = 0.5
+    r.phrase_threshold = 0.3
+    mic_index, mic_name = _pick_microphone_index()
     try:
-        with sr.Microphone() as source:
-            r.adjust_for_ambient_noise(source, duration=0.5)
-            audio = r.listen(source, timeout=timeout, phrase_time_limit=phrase_time_limit)
-        # TODO: swap this for an offline recogniser (e.g. Vosk) if you
-        # do not want audio sent to a cloud speech service.
-        return r.recognize_google(audio)
+        with sr.Microphone(device_index=mic_index) as source:
+            r.adjust_for_ambient_noise(source, duration=1.0)
+        st["calibrated"] = True
+        print(f"[voice] STT mic: {mic_name or 'system default'} "
+              f"(index {mic_index}), calibrated, energy={r.energy_threshold}")
+    except Exception as e:
+        print(f"[voice] STT mic calibration failed ({e}) - will retry per phrase")
+    st["recognizer"] = r
+    st["mic_index"] = mic_index
+    st["mic_name"] = mic_name
+    return r, mic_index, mic_name
+
+
+def _transcribe_whisper(wav_bytes):
+    """Send WAV bytes to OpenAI Whisper. Returns text. Raises on failure.
+
+    Key is read from the environment and sent only as the Authorization
+    header. It is never printed, logged, or stored.
+    """
+    key = os.environ.get("OPENAI_API_KEY", "")
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+    boundary = uuid.uuid4().hex
+    body = b""
+    body += f"--{boundary}\r\n".encode()
+    body += (b'Content-Disposition: form-data; name="model"\r\n\r\n'
+             + OPENAI_WHISPER_MODEL.encode() + b"\r\n")
+    body += f"--{boundary}\r\n".encode()
+    body += (b'Content-Disposition: form-data; name="language"\r\n\r\n'
+             b"en\r\n")
+    body += f"--{boundary}\r\n".encode()
+    body += (b'Content-Disposition: form-data; name="prompt"\r\n\r\n'
+             + _WHISPER_PROMPT.encode() + b"\r\n")
+    body += f"--{boundary}\r\n".encode()
+    body += (b'Content-Disposition: form-data; name="file"; '
+             b'filename="speech.wav"\r\n'
+             b"Content-Type: audio/wav\r\n\r\n")
+    body += wav_bytes + b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+    req = urllib.request.Request(
+        OPENAI_WHISPER_URL,
+        data=body,
+        headers={
+            "Authorization": "Bearer " + key,
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Whisper request failed (HTTP {e.code})") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Whisper request failed ({e.reason})") from e
+    return (data.get("text") or "").strip()
+
+
+def _wav_is_silence(wav_bytes):
+    """True if the WAV is too short/quiet to be real speech.
+
+    Guards against Whisper hallucinating on a noise/click segment
+    (it echoed the old prompt on a silent segment live 2026-11-24).
+    Returns True for <0.4s of audio or RMS below ~0.5% of full scale.
+    """
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate() or 16000
+            width = wf.getsampwidth()
+            raw = wf.readframes(frames)
+        if frames / max(rate, 1) < 0.4:
+            return True
+        if width == 2:
+            samples = struct.unpack(f"<{len(raw) // 2}h", raw[: len(raw) // 2 * 2])
+            scale = 32768.0
+        elif width == 1:
+            samples = [b - 128 for b in raw]
+            scale = 128.0
+        else:
+            return False
+        if not samples:
+            return True
+        rms = math.sqrt(sum(float(s) * float(s) for s in samples) / len(samples)) / scale
+        return rms < 0.005
     except Exception:
-        # Includes WaitTimeoutError, UnknownValueError, RequestError.
+        return False
+
+
+def transcribe_wav_bytes(wav_bytes):
+    """Transcribe WAV bytes with Whisper, falling back to Google.
+
+    Used by the --listen-test harness and by listen_once(). Returns
+    "" on total failure. Sets last_stt_engine() so the GUI log can
+    show which engine heard it.
+    """
+    if _wav_is_silence(wav_bytes):
+        _set_last_engine("")
         return ""
+    try:
+        text = _transcribe_whisper(wav_bytes)
+        if text:
+            _set_last_engine("whisper")
+            return text
+    except Exception as e:
+        print(f"[voice] Whisper failed ({e}) - trying Google fallback.")
+    # Fallback: Google web speech on the same audio (decode the WAV
+    # header first — AudioData takes raw frames, not a .wav file).
+    try:
+        import speech_recognition as sr
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            raw = wf.readframes(wf.getnframes())
+            rate = wf.getframerate()
+            width = wf.getsampwidth()
+        audio = sr.AudioData(raw, rate, width)
+        r = sr.Recognizer()
+        text = r.recognize_google(audio)
+        if text:
+            _set_last_engine("google")
+            return (text or "").strip()
+    except Exception:
+        pass
+    _set_last_engine("")
+    return ""
+
+
+def listen_once(timeout=10, phrase_time_limit=30):
+    """
+    Listen once from Lorenza's microphone and return transcribed text,
+    or "" if nothing was heard or transcription failed.
+    No wake word is checked - any intelligible speech is returned.
+    Primary engine: OpenAI Whisper (see _transcribe_whisper);
+    fallback: Google Speech Recognition.
+    """
+    r, mic_index, _mic_name = _get_listener()
+    if r is None:
+        return ""
+    try:
+        import speech_recognition as sr
+        with sr.Microphone(device_index=mic_index) as source:
+            audio = r.listen(source, timeout=timeout,
+                             phrase_time_limit=phrase_time_limit)
+    except Exception:
+        # Includes WaitTimeoutError (silence) and mic errors.
+        return ""
+    try:
+        wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
+    except Exception:
+        return ""
+    return transcribe_wav_bytes(wav_bytes)
 
 
 if __name__ == "__main__":
-    # PC test: run `python voice.py` and listen.
+    import sys
+    # Dictation test: `python voice.py --listen-test 15` — listens for
+    # up to 15s, transcribes with Whisper, prints what it heard.
     # Prints the key's presence only - never the key value.
+    if "--listen-test" in sys.argv:
+        secs = 15
+        try:
+            secs = int(sys.argv[sys.argv.index("--listen-test") + 1])
+        except Exception:
+            pass
+        print(f"[voice] listen-test: speak now, up to {secs}s ...")
+        heard = listen_once(timeout=secs, phrase_time_limit=secs)
+        print(f"[voice] listen-test: engine={last_stt_engine()} heard={heard!r}")
+        raise SystemExit(0 if heard else 1)
+    # PC test: run `python voice.py` and listen.
     print("[voice] test: OPENAI_API_KEY set:",
           bool(os.environ.get("OPENAI_API_KEY", "")))
     try:

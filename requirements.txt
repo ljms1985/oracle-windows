@@ -4,7 +4,15 @@ openai
 pyttsx3
 SpeechRecognition
 pyaudio
-opencv-python
+# Speech-to-text (2026-11-24 STT fix): OpenAI Whisper API (whisper-1)
+# via plain urllib in voice.py — no extra package needed, no torch/
+# faster-whisper install. Key from OPENAI_API_KEY env var only.
+# Google Speech Recognition (via SpeechRecognition) is the fallback.
+opencv-python==4.11.0.86
+# Pinned to 4.11: opencv-python 5.x removed CascadeClassifier and
+# HOGDescriptor, which camera auto-tracking (tracking.py) and local
+# face detection (face_profiles.py, identity.py) rely on. Do not
+# upgrade to 5.x until those modules are rewritten for it.
 Pillow  # required for the avatar image in gui.py (assets/avatar.png)
 numpy
 trimesh

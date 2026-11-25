@@ -93,3 +93,35 @@ unchanged.
   (same head-and-shoulders framing works best) and restart the GUI.
   If the new image has a different face position, the eye/mouth
   offsets in `_draw_avatar()` will need re-measuring.
+
+## Hi-res update (2026-11-24, source only — not yet in a released package)
+
+Lorenza: "make the Avatar look cleaner, it's not as high res as I would like."
+
+**What was low-res before:** the avatar image itself is 1600x1600, but
+`gui.py` rendered it at only **260x239 px** in a 300 px-high canvas, and
+the app was **not DPI-aware** — Windows bitmap-scales the whole Tk
+window at 125%/150% display scaling, blurring that small image further.
+The blink/mouth overlays were also drawn at that 260 px scale.
+
+**What changed in `gui.py`:**
+- Avatar render **260x239 → 420x386 px** (1.615x), core canvas **300 → 480 px**,
+  face re-centred (cy 138 → 210), aura radii scaled, waveform moved down.
+- **Windows DPI awareness** (`SetProcessDpiAwareness(2)`, fallback
+  `SetProcessDPIAware()`, guarded) before `import tkinter`, so Windows
+  no longer bitmap-scales the window.
+- **Sharpening** after the LANCZOS resize (Sharpness 1.25, Contrast 1.05).
+- Blink bar and speaking-mouth overlays scaled 1.615x; mouth height
+  clamped (wide/open ≤ 0.7× width) so it reads as an open mouth, not a
+  round hole. Avatar-only window enlarged to 440x400 with the same image.
+- Character design unchanged — same red-and-black anime figure.
+
+**Live test on Lorenza's PC (2026-11-24 ~18:15 EST):** patched source
+`C:\friend-agent\gui.py` (pre-patch v1.0.6 backup at
+`C:\friend-agent\gui.py.v106-pre-hires-avatar.bak`), restarted via
+`OracleSourceRun`. Verified by PrintWindow captures of the live window:
+avatar is large and sharp, animation + speaking still work, GUI replies.
+Screenshots: `~/workspace/goals/windows-oracle-agent-build/hidden_files/avatar-hires-pc-live-20261124.png`.
+Note: two Oracle GUI instances were running on the PC at the time (one
+new hi-res, one older small-avatar instance) — the older one was left
+running, not killed.
